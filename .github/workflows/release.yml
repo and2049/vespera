@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [Host verification]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Read version from commit subject
+        id: version
+        run: |
+          subject="$(git log -1 --format=%s "$SHA")"
+          if [[ ! "$subject" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Commit subject '$subject' is not a version; nothing to release."
+            exit 0
+          fi
+          if gh release view "$subject" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$subject" >/dev/null; then
+            echo "$subject already exists; nothing to release."
+            exit 0
+          fi
+          echo "tag=$subject" >> "$GITHUB_OUTPUT"
+          echo "number=${subject#v}" >> "$GITHUB_OUTPUT"
+      - name: Install Ninja
+        if: steps.version.outputs.tag
+        run: brew install ninja
+      - name: Build app
+        if: steps.version.outputs.tag
+        env:
+          VESPERA_CONFIGURATION: release
+          VESPERA_VERSION: ${{ steps.version.outputs.number }}
+        run: |
+          [[ "$(uname -m)" == arm64 ]]
+          cmake --preset release
+          zsh apps/macos/build-app.sh
+          for binary in build/vespera.app/Contents/MacOS/*; do
+            [[ "$(lipo -archs "$binary")" == arm64 ]]
+          done
+      - name: Package
+        if: steps.version.outputs.tag
+        run: ditto -c -k --keepParent build/vespera.app "build/vespera-${{ steps.version.outputs.tag }}-macos-arm64.zip"
+      - name: Tag and publish release
+        if: steps.version.outputs.tag
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "build/vespera-${{ steps.version.outputs.tag }}-macos-arm64.zip" \
+            --target "$SHA" --title "${{ steps.version.outputs.tag }}" --generate-notes
