@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "background": "background.svg",
+  "crop": [0, 0, 200, 100],
+  "widgets": [
+    {"type": "file", "slot": 2, "rect": [10, 10, 180, 32]},
+    {"type": "textButton", "id": 1, "rect": [10, 55, 180, 32], "text": "Level", "minimum": 0, "maximum": 1}
+  ]
+}

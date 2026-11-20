@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "crop": [0, 0, 200, 100],
+  "background": "background.svg",
+  "widgets": [
+    {"type": "textEditor", "rect": [60, 10, 60, 20], "id": 2, "name": "Drive", "readonly": true,
+     "format": {"range": [0, 10]}},
+    {"type": "textEditor", "rect": [60, 40, 60, 20], "id": 4, "name": "Character", "readonly": true,
+     "choices": ["Warm", "Hot"]}
+  ]
+}

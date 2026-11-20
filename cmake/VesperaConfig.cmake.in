@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/VesperaTargets.cmake")
+
+set(VESPERA_SDK_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@" CACHE PATH
+    "Directory containing the Vespera module SDK" FORCE)
+include("${CMAKE_CURRENT_LIST_DIR}/VesperaModule.cmake")
+
+check_required_components(Vespera)

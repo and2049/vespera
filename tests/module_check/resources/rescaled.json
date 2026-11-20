@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "crop": [0, 0, 200, 100],
+  "background": "background.svg",
+  "widgets": [
+    {"type": "textButton", "rect": [10, 10, 40, 20], "id": 1, "name": "Enabled", "text": "ON", "initial": 1},
+    {"type": "textEditor", "rect": [60, 10, 60, 20], "id": 2, "name": "Drive", "initial": 0.25,
+     "format": {"range": [0, 10], "decimals": 1}},
+    {"type": "textEditor", "rect": [60, 40, 60, 20], "id": 3, "name": "Level", "minimum": 0, "maximum": 2,
+     "initial": 1, "curve": [0, 2, 0.5]},
+    {"type": "textEditor", "rect": [130, 10, 60, 20], "id": 2, "name": "Drive readout", "readonly": true,
+     "curve": [0, 10, 1]}
+  ]
+}

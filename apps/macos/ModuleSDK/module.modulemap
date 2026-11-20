@@ -1,0 +1,4 @@
+module ModuleSDK {
+  header "module.h"
+  export *
+}

@@ -1,0 +1,58 @@
+{
+  "placement": {
+    "valid": ["before-pre-fx", "before-amp", "before-cabinet", "after-cabinet", "after-eq", "after-post-fx", null],
+    "invalid": ["", "after-amp", "Before-Pre-FX", "after cabinet", " after-eq", 1, true, ["before-amp"], {"value": "after-eq"}]
+  },
+  "formerCategories": {
+    "valid": [[], ["pre-fx"], ["pre-fx", "post-fx"], ["amp", "cab", "pre-fx", "post-fx"], null],
+    "invalid": [["special-fx"], ["pre-fx", "pre-fx"], ["eq"], [""], ["Pre-FX"], "pre-fx", [1], {"pre-fx": true}]
+  },
+  "routingCases": [
+    {"valid": true, "schemaVersion": 2, "fields": {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}},
+    {"valid": true, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8.0, "law": "crossfade"}}}},
+    {"valid": true, "schemaVersion": 2, "fields": {"routing": null}},
+    {"valid": true, "schemaVersion": 2, "fields": {}},
+    {"valid": true, "schemaVersion": 1, "fields": {"routing": null, "routingSelector": null}},
+    {"valid": true, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}]}}},
+    {"valid": true, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 3, "routes": [{"placement": "before-pre-fx", "routing": null}, {"placement": "before-amp"}, {"placement": "before-cabinet"}, {"placement": "after-cabinet"}, {"placement": "after-eq"}, {"placement": "after-post-fx"}, {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 4, "law": "crossfade"}}}, {"placement": "after-post-fx", "routing": {"input": "chain-input", "mix": {"parameter": 5, "law": "crossfade"}}}]}}},
+    {"valid": true, "schemaVersion": 2, "fields": {"routingSelector": null, "placement": "after-eq"}},
+    {"valid": false, "schemaVersion": 1, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 1, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 3, "fields": {}},
+    {"valid": false, "schemaVersion": 2, "category": "pre-fx", "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "category": "amp", "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "graph-input", "mix": {"parameter": 8, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "linear"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input"}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"mix": {"parameter": 8, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8.5, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": -1, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": "8", "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 4294967296, "law": "crossfade"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": "chain-input"}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": []}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "before-amp"}, {"placement": "before-cabinet"}, {"placement": "after-cabinet"}, {"placement": "after-eq"}, {"placement": "after-post-fx"}, {"placement": "after-eq"}, {"placement": "after-post-fx"}, {"placement": "before-amp"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-amp"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": null}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"placement": "after-eq", "routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}, "routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 8, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}}}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": {"placement": "after-eq"}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "sum"}}}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}, "gain": 1}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade", "curve": 2}}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "default": 0, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx", "name": "Pre"}, {"placement": "after-eq"}]}}},
+    {"valid": false, "schemaVersion": 2, "fields": {"routingSelector": {"parameter": 12, "routes": [{"placement": "before-pre-fx"}, {"placement": "after-eq", "routing": {"input": "chain-input", "mix": {"parameter": 8, "law": "crossfade"}, "delay": 0}}]}}}
+  ],
+  "routeIndex": [
+    [0, 2, 0], [0.49, 2, 0], [0.5, 2, 1], [0.51, 2, 1], [1, 2, 1], [1.5, 2, 1], [-0.4, 2, 0],
+    [-0.6, 2, 0], [-100, 2, 0], [1.4999, 3, 1], [1.5, 3, 2], [2.5, 3, 2], [3.5, 8, 4],
+    [6.5, 8, 7], [7.49, 8, 7], [100, 8, 7]
+  ]
+}

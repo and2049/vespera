@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "crop": [0, 0, 200, 100],
+  "background": "background.svg",
+  "widgets": [
+    {"type": "textEditor", "rect": [10, 10, 80, 20], "id": 1, "name": "Gain", "minimum": 0, "maximum": 4,
+     "initial": 1, "format": {"unit": "x", "decimals": 2}}
+  ]
+}

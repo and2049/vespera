@@ -1,0 +1,80 @@
+name: Host verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: brew install clang-format
+      - name: Check C and C++ formatting
+        run: git ls-files '*.c' '*.cpp' '*.h' '*.hpp' '*.mm' | xargs clang-format --dry-run --Werror
+      - name: Check Swift formatting
+        run: swift format lint --strict --recursive apps/macos/Package.swift apps/macos/Sources apps/macos/Tests
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, sanitize, tsan]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 3
+      - name: Test without hardware
+        # CoreMIDI can transiently refuse client creation under sanitizer process churn.
+        run: ctest --preset ${{ matrix.preset }} ${{ matrix.preset != 'debug' && '--repeat until-pass:2' || '' }}
+      - name: Test app
+        if: matrix.preset == 'debug'
+        run: swift test --package-path apps/macos
+      - name: Verify standalone DSP package
+        if: matrix.preset == 'debug'
+        run: |
+          cmake -S dsp -B build/dsp-standalone -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/build/dsp-install"
+          cmake --build build/dsp-standalone --parallel 3
+          ctest --test-dir build/dsp-standalone --output-on-failure
+          cmake --install build/dsp-standalone
+          cmake -S dsp/tests/consumer -B build/dsp-consumer -DCMAKE_PREFIX_PATH="$PWD/build/dsp-install"
+          cmake --build build/dsp-consumer
+          build/dsp-consumer/consumer
+
+  fuzz:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM and Ninja
+        run: brew install llvm ninja
+      - name: Configure
+        run: |
+          llvm="$(brew --prefix llvm)/bin"
+          cmake --preset fuzz -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++"
+      - name: Build
+        run: cmake --build --preset fuzz --parallel 3
+      - name: Smoke tests
+        run: ctest --preset fuzz -R '^(synthetic_audio|fuzz_.*)$'
+      - name: Fuzz audio and preset inputs
+        run: |
+          mkdir -p build/fuzz/artifacts
+          build/fuzz/tests/fuzz/vespera_audio_fuzz build/fuzz/tests/fuzz/corpus/audio -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+          build/fuzz/tests/fuzz/vespera_preset_fuzz build/fuzz/tests/fuzz/corpus/preset -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+          build/fuzz/tests/fuzz/vespera_live_graph_fuzz build/fuzz/tests/fuzz/corpus/live -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+          build/fuzz/tests/fuzz/vespera_dsp_fuzz -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+          build/fuzz/tests/fuzz/vespera_wav_fuzz build/fuzz/tests/fuzz/corpus/wav -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+          build/fuzz/tests/fuzz/vespera_core_io_fuzz -max_total_time=60 -max_len=8192 -artifact_prefix=build/fuzz/artifacts/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-failures
+          path: build/fuzz/artifacts

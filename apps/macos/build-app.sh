@@ -16,6 +16,9 @@ if [[ -n "${VESPERA_VERSION:-}" ]]; then
 fi
 cp "$root/build/$configuration/libvespera_app_audio.dylib" "$app/Contents/MacOS/"
 ditto "$bin/VesperaUI_VesperaUI.bundle" "$app/Contents/Resources/VesperaUI_VesperaUI.bundle"
+xcrun actool "$root/apps/macos/AppIcon.icon" --compile "$app/Contents/Resources" --platform macosx \
+  --minimum-deployment-target 14.0 --app-icon AppIcon \
+  --output-partial-info-plist "$staging/icon.plist" --errors --warnings > /dev/null
 codesign --force --deep --sign - "$app"
 rm -rf "$root/build/vespera.app"
 mv "$app" "$root/build/vespera.app"

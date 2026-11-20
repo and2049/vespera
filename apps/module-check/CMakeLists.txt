@@ -1,0 +1,20 @@
+find_package(Threads REQUIRED)
+
+add_library(vespera_module_check STATIC module_check.cpp harness.cpp checks.cpp allocation.cpp)
+if(APPLE)
+  enable_language(OBJCXX)
+  target_sources(vespera_module_check PRIVATE layout_macos.mm)
+  set_source_files_properties(layout_macos.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+  target_link_libraries(vespera_module_check PRIVATE "-framework AppKit")
+else()
+  target_sources(vespera_module_check PRIVATE layout_portable.cpp)
+endif()
+target_include_directories(vespera_module_check PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vespera_module_check PUBLIC vespera_runtime
+  PRIVATE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+vespera_warnings(vespera_module_check)
+
+add_executable(vespera-module-check main.cpp)
+target_link_libraries(vespera-module-check PRIVATE vespera_module_check Threads::Threads)
+set_target_properties(vespera-module-check PROPERTIES EXPORT_NAME module-check)
+vespera_warnings(vespera-module-check)
