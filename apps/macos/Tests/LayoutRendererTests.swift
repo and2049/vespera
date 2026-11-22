@@ -1183,3 +1183,101 @@ private func version2(_ widgets: [[String: Any]], _ changes: [String: Any] = [:]
     #expect(error.localizedDescription.contains("parameter metadata"))
   }
 }
+
+@MainActor
+@Test func refreshRedrawsOnlyWhatChanged() throws {
+  _ = NSApplication.shared
+  let package = try LayoutPackage()
+  try package.write(
+    layout: version2([
+      [
+        "name": "Gain", "type": "rotaryFilmStripKnob", "rect": [10, 10, 20, 20],
+        "images": ["knob.png"], "id": 2, "initial": 0.5, "label": "Gain",
+      ],
+      [
+        "name": "Power", "type": "imageButton", "rect": [60, 10, 20, 20],
+        "images": ["off.png", "on.png"], "id": 1, "label": "Power",
+      ],
+      [
+        "name": "Gain value", "type": "textEditor", "editing": "click", "rect": [0, 35, 50, 15],
+        "id": 2, "label": "Gain value",
+      ],
+      [
+        "name": "Lamp", "type": "imageButton", "rect": [60, 32, 10, 10], "images": ["on.png"],
+        "id": 1, "readonly": true, "condition": [1, 0.5, 1],
+      ],
+    ]))
+  #expect(package.validate() == nil)
+  let (module, lease) = try open(package)
+  // Panels are layer-backed in their container; layers record invalidation without a window.
+  let controls = lease.view.subviews
+  for view in [lease.view] + controls { view.wantsLayer = true }
+  #expect(controls.allSatisfy { $0.layer != nil })
+  let (gain, power, readout, lamp) = (controls[0], controls[1], controls[2], controls[3])
+  let field = try #require(readout.subviews.first as? NSTextField)
+  func settle() {
+    for view in [lease.view] + controls { view.layer?.displayIfNeeded() }
+  }
+  func redrawn() -> [NSView] { controls.filter { $0.layer?.needsDisplay() == true } }
+  func backgroundRedrawn() -> Bool { lease.view.layer?.needsDisplay() == true }
+
+  try module.setValue(1, 0)
+  lease.refresh()
+  settle()
+  #expect(redrawn().isEmpty && !backgroundRedrawn())
+  let text = field.stringValue
+  lease.refresh()
+  #expect(redrawn().isEmpty && !backgroundRedrawn())
+  #expect(field.stringValue == text && lamp.isHidden)
+
+  try module.setValue(2, 0.25)
+  lease.refresh()
+  #expect(redrawn() == [gain, readout] && !backgroundRedrawn())
+  #expect(field.stringValue != text)
+  #expect(matches(try color(try render(lease.view), 20, 20), LayoutPackage.green))
+
+  settle()
+  try module.setValue(1, 1)
+  lease.refresh()
+  #expect(redrawn().contains(power) && !redrawn().contains(gain))
+  #expect(!lamp.isHidden)
+  #expect(matches(try color(try render(lease.view), 70, 20), .white))
+  settle()
+  lease.refresh()
+  #expect(redrawn().isEmpty && !backgroundRedrawn())
+}
+
+@MainActor
+@Test func panelsPollOnlyInAVisibleWindow() throws {
+  _ = NSApplication.shared
+  let package = try LayoutPackage()
+  let module = try LoadedModule(
+    manifest: package.manifest, directory: package.directory, category: "pre-fx")
+  let panel = NativeModulePanel.Container(module: module)
+  #expect(panel.lease != nil)
+  guard case .paused = panel.polling else {
+    Issue.record("a panel outside a window polled: \(panel.polling)")
+    return
+  }
+  let window = NSWindow(
+    contentRect: NSRect(x: 0, y: 0, width: 100, height: 50), styleMask: .borderless,
+    backing: .buffered, defer: true)
+  window.isReleasedWhenClosed = false
+  window.contentView = panel
+  #expect(!window.occlusionState.contains(.visible))
+  guard case .paused = panel.polling else {
+    Issue.record("a panel in a window that is not on screen polled: \(panel.polling)")
+    return
+  }
+  panel.stop()
+  guard case .stopped = panel.polling else {
+    Issue.record("a stopped panel kept polling: \(panel.polling)")
+    return
+  }
+  panel.updatePolling()
+  guard case .stopped = panel.polling else {
+    Issue.record("a stopped panel resumed: \(panel.polling)")
+    return
+  }
+  #expect(panel.lease == nil)
+}

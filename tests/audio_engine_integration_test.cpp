@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -376,7 +378,7 @@ void test_varying_blocks_and_scheduled_events() {
   CHECK(session.close() == CloseResult::closed);
 }
 
-enum class Fault { module_nan, module_error, module_infinity, input_nan };
+enum class Fault { module_nan, module_error, module_infinity };
 
 void test_dsp_fault_latches_and_recovers(Fault fault) {
   AudioSession session;
@@ -385,10 +387,8 @@ void test_dsp_fault_latches_and_recovers(Fault fault) {
   const uint32_t faulted_stream = session.stream_info().stream_id;
   session.start();
   Buffers buffers(64);
-  const float original = buffers.input[5];
   CHECK(buffers.deliver(64) == AE_PROCESS_OK);
 
-  uint32_t expected_calls = 2;
   switch (fault) {
   case Fault::module_nan:
     probe->fault = PROBE_FAULT_NAN;
@@ -399,21 +399,16 @@ void test_dsp_fault_latches_and_recovers(Fault fault) {
   case Fault::module_infinity:
     probe->fault = PROBE_FAULT_INFINITY;
     break;
-  case Fault::input_nan:
-    buffers.input[5] = std::numeric_limits<float>::quiet_NaN();
-    expected_calls = 1;
-    break;
   }
   probe->fault_instance = 0;
   CHECK(buffers.deliver(64) == AE_PROCESS_FAILED);
   CHECK(buffers.silent(64));
-  CHECK(probe->blocks[0].calls == expected_calls);
+  CHECK(probe->blocks[0].calls == 2);
 
   probe->fault = PROBE_FAULT_NONE;
-  buffers.input[5] = original;
   CHECK(buffers.deliver(64) == AE_PROCESS_SILENCE);
   CHECK(buffers.silent(64));
-  CHECK(probe->blocks[0].calls == expected_calls);
+  CHECK(probe->blocks[0].calls == 2);
 
   auto status = session.poll();
   CHECK(status.state == SessionState::recovery_required);
@@ -442,6 +437,59 @@ void test_dsp_fault_latches_and_recovers(Fault fault) {
   CHECK(status.state == SessionState::running);
   CHECK(status.stream.state == DeviceStreamState::running);
   CHECK(status.telemetry.processing_failures == 0);
+  CHECK(session.close() == CloseResult::closed);
+}
+
+// A driver delivering non-finite samples must not stop audio: the graph, during a crossfade too,
+// receives them as zero and the stream keeps running, while the input meter counts them as clipped.
+void test_non_finite_input_plays_as_silence() {
+  AudioSession session;
+  session.graph().add_module(probe_module);
+  session.prepare(config());
+  session.start();
+  Buffers buffers(64);
+  CHECK(buffers.deliver(64) == AE_PROCESS_OK);
+  static_cast<void>(session.read_meters());
+
+  const std::array<uint32_t, 3> poisoned{0, 5, 63};
+  const std::array<float, 3> values{std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::infinity(),
+                                    -std::numeric_limits<float>::infinity()};
+  const std::vector<float> clean = buffers.input;
+  for (size_t i = 0; i < poisoned.size(); ++i) {
+    buffers.input[poisoned[i]] = values[i];
+  }
+  const auto expected = [&](uint32_t frame, float gain) {
+    const bool zeroed = std::find(poisoned.begin(), poisoned.end(), frame) != poisoned.end();
+    return zeroed ? 0.0f : clean[frame] * gain;
+  };
+  CHECK(buffers.deliver(64) == AE_PROCESS_OK);
+  CHECK(probe->blocks[0].calls == 2);
+  bool exact = true;
+  for (uint32_t i = 0; i < 64; ++i) {
+    exact = exact && buffers.left[i] == expected(i, 1.0f) && buffers.right[i] == expected(i, 1.0f);
+  }
+  CHECK(exact);
+  const auto meters = session.read_meters();
+  CHECK(meters.inputs[0].clipped_samples == poisoned.size());
+  CHECK(meters.inputs[0].peak == vespera::meter_ceiling);
+  CHECK(!meters.outputs[0].clipped() && !meters.outputs[1].clipped());
+
+  session.request_graph_replacement(std::make_unique<vespera::Graph>(), 128);
+  CHECK(buffers.deliver(64) == AE_PROCESS_OK);
+  CHECK(probe->blocks[0].calls == 3);
+  exact = true;
+  for (uint32_t i = 0; i < 64; ++i) {
+    exact = exact && std::isfinite(buffers.left[i]) &&
+            (buffers.left[i] == 0.0f) == (expected(i, 1.0f) == 0.0f);
+  }
+  CHECK(exact);
+
+  const auto status = session.poll();
+  CHECK(status.state == SessionState::running);
+  CHECK(status.recovery == RecoveryReason::none);
+  CHECK(status.telemetry.processing_failures == 0);
+  CHECK(status.telemetry.blocks == 3);
   CHECK(session.close() == CloseResult::closed);
 }
 
@@ -844,8 +892,7 @@ int main(int argc, char **argv) {
        [] { test_dsp_fault_latches_and_recovers(Fault::module_error); }},
       {"module_infinity_latches_and_recovers",
        [] { test_dsp_fault_latches_and_recovers(Fault::module_infinity); }},
-      {"input_nan_latches_and_recovers",
-       [] { test_dsp_fault_latches_and_recovers(Fault::input_nan); }},
+      {"non_finite_input_plays_as_silence", test_non_finite_input_plays_as_silence},
       {"device_fault_blocks_dispatch_and_restart", test_device_fault_blocks_dispatch_and_restart},
       {"backend_start_stop_close_failures", test_backend_start_stop_close_failures},
       {"live_replacement_preserves_engine_timeline",

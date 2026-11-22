@@ -29,26 +29,29 @@ namespace vespera::sdk {
  * Acquisition can fail, for example when the lock file cannot be opened. The lock is then not
  * held and converts to false; callers must not make lifecycle calls. Preparation reports an
  * error, and release abandons the instance rather than disposing it unserialized.
+ *
+ * Constructed with std::try_to_lock it never waits: acquisition() is busy while another thread
+ * or library holds the lock, so a thread that must stay responsive can retry later.
  */
 class PluginLifecycleLock {
 public:
+  enum class Acquisition { held, busy, failed };
+
   PluginLifecycleLock() {
     State &s = state();
     s.mutex.lock();
-    bool held = s.depth > 0;
-    try {
-      held = held || s.acquire_file();
-    } catch (...) {
-    }
-    if (!held) {
-      s.mutex.unlock();
+    finish(s, s.depth > 0 ? Attempt::held : s.acquire_file(true));
+  }
+  explicit PluginLifecycleLock(std::try_to_lock_t) {
+    State &s = state();
+    if (!s.mutex.try_lock()) {
+      acquisition_ = Acquisition::busy;
       return;
     }
-    ++s.depth;
-    acquired_ = true;
+    finish(s, s.depth > 0 ? Attempt::held : s.acquire_file(false));
   }
   ~PluginLifecycleLock() {
-    if (!acquired_) {
+    if (acquisition_ != Acquisition::held) {
       return;
     }
     State &s = state();
@@ -60,9 +63,12 @@ public:
   PluginLifecycleLock(const PluginLifecycleLock &) = delete;
   PluginLifecycleLock &operator=(const PluginLifecycleLock &) = delete;
 
-  explicit operator bool() const noexcept { return acquired_; }
+  explicit operator bool() const noexcept { return acquisition_ == Acquisition::held; }
+  Acquisition acquisition() const noexcept { return acquisition_; }
 
 private:
+  enum class Attempt { held, busy, failed };
+
   struct State {
     std::recursive_mutex mutex;
     int depth = 0;
@@ -80,28 +86,36 @@ private:
 #endif
     }
 
-    bool acquire_file() {
+    Attempt acquire_file(bool wait) noexcept {
 #if defined(__APPLE__) || defined(__linux__)
-      if (descriptor < 0) {
-        const std::string base = directory();
-        if (base.empty()) {
-          return false;
-        }
-        const std::string path = base + (base.back() == '/' ? "" : "/") +
-                                 "vespera-plugin-lifecycle-" + std::to_string(getpid()) + ".lock";
-        descriptor = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+      try {
         if (descriptor < 0) {
-          return false;
+          const std::string base = directory();
+          if (base.empty()) {
+            return Attempt::failed;
+          }
+          const std::string path = base + (base.back() == '/' ? "" : "/") +
+                                   "vespera-plugin-lifecycle-" + std::to_string(getpid()) + ".lock";
+          descriptor = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+          if (descriptor < 0) {
+            return Attempt::failed;
+          }
         }
+      } catch (...) {
+        return Attempt::failed;
       }
-      while (flock(descriptor, LOCK_EX) != 0) {
+      while (flock(descriptor, LOCK_EX | (wait ? 0 : LOCK_NB)) != 0) {
+        if (errno == EWOULDBLOCK && !wait) {
+          return Attempt::busy;
+        }
         if (errno != EINTR) {
-          return false;
+          return Attempt::failed;
         }
       }
-      return true;
+      return Attempt::held;
 #else
-      return false;
+      static_cast<void>(wait);
+      return Attempt::failed;
 #endif
     }
     void release_file() {
@@ -116,7 +130,17 @@ private:
     return *instance;
   }
 
-  bool acquired_ = false;
+  void finish(State &s, Attempt attempt) noexcept {
+    if (attempt != Attempt::held) {
+      s.mutex.unlock();
+      acquisition_ = attempt == Attempt::busy ? Acquisition::busy : Acquisition::failed;
+      return;
+    }
+    ++s.depth;
+    acquisition_ = Acquisition::held;
+  }
+
+  Acquisition acquisition_ = Acquisition::failed;
 };
 
 }

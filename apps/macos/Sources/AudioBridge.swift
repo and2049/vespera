@@ -22,6 +22,8 @@ enum BridgeOp: String {
   case globals
   case cancelCandidate
   case renderGraph
+  case record
+  case reamp
 }
 
 final class AudioBridge {

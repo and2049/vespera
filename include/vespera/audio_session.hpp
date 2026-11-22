@@ -22,6 +22,9 @@ struct ae_stream;
 
 namespace vespera {
 
+struct TakeOptions;
+struct TakeStatus;
+
 class AudioError : public std::runtime_error {
 public:
   AudioError(int32_t code, std::string operation, const std::string &detail);
@@ -411,6 +414,16 @@ public:
   // are each exact and lossless across intervals, but a block in flight during the read may be
   // counted in the peak of one interval and the RMS and clip counts of the next.
   MeterReading read_meters() noexcept;
+
+  // Records the raw device input to a take (see TakeRecorder) at the negotiated rate and input
+  // channel count. Requires the running state. A take continues across stop() and start() while
+  // the stream stays open, counting the restart as a discontinuity, and ends when the session
+  // enters recovery_required or closes; close() finalizes it once the stream is quiescent.
+  void start_take(const TakeOptions &options);
+  // Idempotent; a stopped stream finalizes at once, a running one at its next block boundary.
+  void stop_take() noexcept;
+  TakeStatus take_status() const;
+
   SessionState state() const noexcept { return state_; }
   RecoveryReason recovery_reason() const noexcept { return recovery_; }
   const StreamInfo &stream_info() const;

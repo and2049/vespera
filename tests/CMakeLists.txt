@@ -1,5 +1,10 @@
 find_package(Threads REQUIRED)
 
+# Bridge tests compile the bridge with the session against the fake audio engine.
+set(app_audio_sources ${PROJECT_SOURCE_DIR}/src/app_audio.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio_session.cpp ${PROJECT_SOURCE_DIR}/src/offline_render.cpp
+  ${PROJECT_SOURCE_DIR}/src/reamp_job.cpp)
+
 # The gain module moved here from examples/; it is the shared-engine fixture behind many tests.
 add_library(vespera_fixture_gain MODULE fixtures/gain_module.cpp)
 target_include_directories(vespera_fixture_gain PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -65,7 +70,7 @@ target_include_directories(vespera_fixture_tempo PRIVATE ${PROJECT_SOURCE_DIR}/i
 target_compile_features(vespera_fixture_tempo PRIVATE cxx_std_20)
 
 add_executable(vespera_app_audio_test app_audio_test.cpp fake_audio_engine.cpp
-  ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+  ${app_audio_sources})
 target_include_directories(vespera_app_audio_test PRIVATE
   $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(vespera_app_audio_test PRIVATE vespera_runtime vespera_core_io nlohmann_json::nlohmann_json)
@@ -104,6 +109,34 @@ vespera_warnings(vespera_ui_tokens_test)
 add_test(NAME ui_tokens COMMAND vespera_ui_tokens_test)
 add_test(NAME ui_token_drift COMMAND ${CMAKE_COMMAND} -DROOT=${PROJECT_SOURCE_DIR}
   -P ${CMAKE_CURRENT_SOURCE_DIR}/ui_token_drift.cmake)
+
+add_library(vespera_fixture_delay MODULE fixtures/delay_module.cpp)
+add_library(vespera_fixture_delay_unbounded MODULE fixtures/delay_module.cpp)
+target_compile_definitions(vespera_fixture_delay_unbounded PRIVATE
+  "DELAY_ID=\"test.delay.unbounded\"" DELAY_TAIL=UINT64_MAX)
+add_library(vespera_fixture_echo MODULE fixtures/echo_module.cpp)
+foreach(target vespera_fixture_delay vespera_fixture_delay_unbounded vespera_fixture_echo)
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  set_target_properties(${target} PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+  vespera_warnings(${target})
+endforeach()
+add_executable(vespera_offline_render_test offline_render_test.cpp fake_audio_engine.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio_session.cpp ${PROJECT_SOURCE_DIR}/src/offline_render.cpp)
+target_include_directories(vespera_offline_render_test PRIVATE ${PROJECT_SOURCE_DIR}/src
+  $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+target_link_libraries(vespera_offline_render_test PRIVATE vespera_runtime vespera_core_io)
+vespera_warnings(vespera_offline_render_test)
+add_dependencies(vespera_offline_render_test vespera_fixture_gain vespera_fixture_delay
+  vespera_fixture_delay_unbounded vespera_fixture_echo)
+add_test(NAME offline_render COMMAND vespera_offline_render_test
+  $<TARGET_FILE:vespera_fixture_gain> $<TARGET_FILE:vespera_fixture_delay>
+  $<TARGET_FILE:vespera_fixture_delay_unbounded> $<TARGET_FILE:vespera_fixture_echo>)
+
+add_executable(vespera_wav_file_test wav_file_test.cpp)
+target_link_libraries(vespera_wav_file_test PRIVATE vespera_wav)
+vespera_warnings(vespera_wav_file_test)
+add_test(NAME wav_file COMMAND vespera_wav_file_test)
 
 add_executable(vespera_core_io_test core_io_test.cpp)
 target_link_libraries(vespera_core_io_test PRIVATE vespera_core_io)
@@ -215,7 +248,7 @@ add_test(NAME app_audio COMMAND vespera_app_audio_test $<TARGET_FILE:vespera_fix
   ${special_fixture_files})
 
 add_executable(vespera_app_audio_services_test app_audio_services_test.cpp fake_audio_engine.cpp
-  ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+  ${app_audio_sources})
 target_include_directories(vespera_app_audio_services_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
   $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
 target_compile_features(vespera_app_audio_services_test PRIVATE cxx_std_20)
@@ -231,12 +264,29 @@ add_test(NAME app_audio_services COMMAND vespera_app_audio_services_test
   $<TARGET_FILE:vespera_fixture_services>)
 set_tests_properties(app_audio_services PROPERTIES TIMEOUT 120)
 
+add_executable(vespera_app_audio_reamp_test app_audio_reamp_test.cpp fake_audio_engine.cpp
+  ${app_audio_sources})
+target_include_directories(vespera_app_audio_reamp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+  $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+target_compile_features(vespera_app_audio_reamp_test PRIVATE cxx_std_20)
+target_link_libraries(vespera_app_audio_reamp_test PRIVATE vespera_runtime vespera_core_io
+  nlohmann_json::nlohmann_json Threads::Threads)
+if(APPLE)
+  target_link_libraries(vespera_app_audio_reamp_test PRIVATE "-framework CoreMIDI"
+    "-framework CoreFoundation")
+endif()
+vespera_warnings(vespera_app_audio_reamp_test)
+add_dependencies(vespera_app_audio_reamp_test vespera_fixture_gain)
+add_test(NAME app_audio_reamp COMMAND vespera_app_audio_reamp_test
+  $<TARGET_FILE:vespera_fixture_gain>)
+set_tests_properties(app_audio_reamp PROPERTIES TIMEOUT 120)
+
 add_library(vespera_fixture_opaque_state MODULE fixtures/opaque_state_module.cpp)
 target_include_directories(vespera_fixture_opaque_state PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(vespera_fixture_opaque_state PRIVATE cxx_std_20)
 set_target_properties(vespera_fixture_opaque_state PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
 add_executable(vespera_app_audio_state_test app_audio_state_test.cpp fake_audio_engine.cpp
-  ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+  ${app_audio_sources})
 target_include_directories(vespera_app_audio_state_test PRIVATE
   $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
 target_compile_features(vespera_app_audio_state_test PRIVATE cxx_std_20)
@@ -339,6 +389,7 @@ add_test(NAME parameter_queue COMMAND vespera_parameter_queue_test)
 
 add_test(NAME cli COMMAND ${CMAKE_COMMAND} -DHOST=$<TARGET_FILE:vespera>
   -DGAIN=$<TARGET_FILE:vespera_fixture_gain> -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-presets
+  -DTAKES=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/takes
   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.cmake)
 
 add_executable(vespera_core_io_session_test core_io_session_test.cpp scripted_audio_backend.cpp
@@ -441,7 +492,7 @@ vespera_route_fixture(three ROUTE_COUNT=3)
 vespera_route_fixture(slow ROUTE_LATENCY_1=24)
 vespera_route_fixture(failing ROUTE_FAILS=1)
 add_executable(vespera_app_audio_route_test app_audio_route_test.cpp fake_audio_engine.cpp
-  ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+  ${app_audio_sources})
 target_include_directories(vespera_app_audio_route_test PRIVATE
   $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
 target_compile_features(vespera_app_audio_route_test PRIVATE cxx_std_20)
@@ -490,7 +541,7 @@ add_test(NAME native_branch COMMAND vespera_native_branch_test
   $<TARGET_FILE:vespera_fixture_native_branch_older>)
 
 add_executable(vespera_app_audio_native_branch_test app_audio_native_branch_test.cpp
-  fake_audio_engine.cpp ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+  fake_audio_engine.cpp ${app_audio_sources})
 target_include_directories(vespera_app_audio_native_branch_test PRIVATE
   $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
 target_compile_features(vespera_app_audio_native_branch_test PRIVATE cxx_std_20)
@@ -516,7 +567,7 @@ if(APPLE)
   target_link_libraries(vespera_fixture_bridge_dispatch PRIVATE "-framework CoreFoundation")
   vespera_warnings(vespera_fixture_bridge_dispatch)
   add_executable(vespera_app_audio_dispatch_test app_audio_dispatch_test.cpp fake_audio_engine.cpp
-    ${PROJECT_SOURCE_DIR}/src/app_audio.cpp ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+    ${app_audio_sources})
   target_include_directories(vespera_app_audio_dispatch_test PRIVATE
     $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
   target_compile_features(vespera_app_audio_dispatch_test PRIVATE cxx_std_20)
@@ -529,6 +580,64 @@ if(APPLE)
     $<TARGET_FILE:vespera_fixture_bridge_dispatch>)
   set_tests_properties(app_audio_dispatch PROPERTIES TIMEOUT 30)
 endif()
+
+add_executable(vespera_take_recorder_test take_recorder_test.cpp)
+target_link_libraries(vespera_take_recorder_test PRIVATE vespera_take nlohmann_json::nlohmann_json
+  Threads::Threads)
+vespera_warnings(vespera_take_recorder_test)
+add_test(NAME take_recorder COMMAND vespera_take_recorder_test)
+set_tests_properties(take_recorder PROPERTIES TIMEOUT 120)
+
+add_executable(vespera_take_session_test take_session_test.cpp fake_audio_engine.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio_session.cpp)
+target_include_directories(vespera_take_session_test PRIVATE
+  $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+target_link_libraries(vespera_take_session_test PRIVATE vespera_runtime vespera_core_io
+  nlohmann_json::nlohmann_json)
+vespera_warnings(vespera_take_session_test)
+add_dependencies(vespera_take_session_test vespera_fixture_gain)
+add_test(NAME take_session COMMAND vespera_take_session_test $<TARGET_FILE:vespera_fixture_gain>)
+set_tests_properties(take_session PROPERTIES TIMEOUT 60)
+
+add_executable(vespera_take_bridge_test take_bridge_test.cpp fake_audio_engine.cpp
+  ${app_audio_sources})
+target_include_directories(vespera_take_bridge_test PRIVATE
+  $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+target_link_libraries(vespera_take_bridge_test PRIVATE vespera_runtime vespera_core_io
+  nlohmann_json::nlohmann_json)
+if(APPLE)
+  target_link_libraries(vespera_take_bridge_test PRIVATE "-framework CoreMIDI"
+    "-framework CoreFoundation")
+endif()
+vespera_warnings(vespera_take_bridge_test)
+add_dependencies(vespera_take_bridge_test vespera_fixture_gain)
+add_test(NAME take_bridge COMMAND vespera_take_bridge_test $<TARGET_FILE:vespera_fixture_gain>)
+set_tests_properties(take_bridge PROPERTIES TIMEOUT 60)
+
+add_executable(vespera_take_reamp_parity_test take_reamp_parity_test.cpp fake_audio_engine.cpp
+  ${app_audio_sources})
+target_include_directories(vespera_take_reamp_parity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+  $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+target_link_libraries(vespera_take_reamp_parity_test PRIVATE vespera_runtime vespera_core_io
+  nlohmann_json::nlohmann_json Threads::Threads)
+if(APPLE)
+  target_link_libraries(vespera_take_reamp_parity_test PRIVATE "-framework CoreMIDI"
+    "-framework CoreFoundation")
+endif()
+vespera_warnings(vespera_take_reamp_parity_test)
+add_dependencies(vespera_take_reamp_parity_test vespera_fixture_gain vespera_fixture_delay)
+add_test(NAME take_reamp_parity COMMAND vespera_take_reamp_parity_test
+  $<TARGET_FILE:vespera_fixture_gain> $<TARGET_FILE:vespera_fixture_delay>)
+set_tests_properties(take_reamp_parity PROPERTIES TIMEOUT 300)
+
+# Executables that compile the audio session directly also need its take recorder.
+get_property(session_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY BUILDSYSTEM_TARGETS)
+foreach(target IN LISTS session_targets)
+  get_property(sources TARGET ${target} PROPERTY SOURCES)
+  if(sources MATCHES "src/audio_session\\.cpp")
+    target_link_libraries(${target} PRIVATE vespera_take)
+  endif()
+endforeach()
 
 if(VESPERA_SANITIZERS)
   # Dlopened fixture modules stand in for external plugins, which are never built with this
@@ -543,4 +652,37 @@ if(VESPERA_SANITIZERS)
       target_link_options(${fixture} PRIVATE -fno-sanitize=address,undefined)
     endif()
   endforeach()
+endif()
+
+if(APPLE)
+  add_library(vespera_fixture_fake_au MODULE fixtures/fake_au_module.cpp)
+  target_include_directories(vespera_fixture_fake_au PRIVATE ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_features(vespera_fixture_fake_au PRIVATE cxx_std_20)
+  target_link_libraries(vespera_fixture_fake_au PRIVATE "-framework AudioToolbox"
+    "-framework CoreFoundation")
+  set_target_properties(vespera_fixture_fake_au PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+  vespera_warnings(vespera_fixture_fake_au)
+  add_executable(vespera_audio_unit_disposal_test audio_unit_disposal_test.cpp
+    fake_audio_unit.cpp fake_audio_engine.cpp ${app_audio_sources})
+  target_include_directories(vespera_audio_unit_disposal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/src $<TARGET_PROPERTY:audio_engine,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_features(vespera_audio_unit_disposal_test PRIVATE cxx_std_20)
+  target_link_libraries(vespera_audio_unit_disposal_test PRIVATE vespera_runtime vespera_core_io
+    vespera_take nlohmann_json::nlohmann_json Threads::Threads "-framework AudioToolbox"
+    "-framework CoreMIDI" "-framework CoreFoundation")
+  vespera_warnings(vespera_audio_unit_disposal_test)
+  add_dependencies(vespera_audio_unit_disposal_test vespera_fixture_fake_au)
+  add_test(NAME audio_unit_disposal COMMAND vespera_audio_unit_disposal_test
+    $<TARGET_FILE:vespera_fixture_fake_au>)
+  set_tests_properties(audio_unit_disposal PROPERTIES TIMEOUT 60)
+  add_executable(vespera_audio_unit_preparation_test audio_unit_preparation_test.cpp
+    fake_audio_unit.cpp)
+  target_include_directories(vespera_audio_unit_preparation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(vespera_audio_unit_preparation_test PRIVATE vespera_runtime
+    Threads::Threads "-framework AudioToolbox" "-framework CoreFoundation")
+  vespera_warnings(vespera_audio_unit_preparation_test)
+  add_test(NAME audio_unit_preparation COMMAND vespera_audio_unit_preparation_test)
+  set_tests_properties(audio_unit_preparation PROPERTIES TIMEOUT 60)
 endif()

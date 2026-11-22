@@ -187,11 +187,12 @@ private func amp(
 }
 
 @MainActor
-@Test func ampsDecodeTheirBackgroundOnceWhenLoaded() throws {
+@Test func ampsCheckOnlyTheBackgroundHeaderWhenLoaded() throws {
   let declaring = try amp("valid", equalizer: "org.example.test-eq")
   let module = try LoadedModule(
     manifest: declaring.manifest, directory: declaring.package.directory)
-  let image = try #require(module.windowBackground)
+  let url = try #require(module.windowBackground)
+  let image = try WindowBackgroundImage.decode(url)
   #expect(image.width == 8 && image.height == 4)
   #expect(module.equalizer?.windowBackground == nil)
   let plain = try LoadedModule(
@@ -200,9 +201,14 @@ private func amp(
 
   for name in ["corrupt-data", "short-data", "animated"] {
     let broken = try amp(name)
+    let loaded = try LoadedModule(manifest: broken.manifest, directory: broken.package.directory)
     #expect(throws: AmpError.self, "\(name)") {
-      try LoadedModule(manifest: broken.manifest, directory: broken.package.directory)
+      try WindowBackgroundImage.decode(try #require(loaded.windowBackground))
     }
+  }
+  let oversized = try amp("too-wide")
+  #expect(throws: AmpError.self) {
+    try LoadedModule(manifest: oversized.manifest, directory: oversized.package.directory)
   }
   let pedal = ModuleManifest(
     windowBackground: "window.png", schemaVersion: 1, id: declaring.manifest.id,
@@ -221,23 +227,53 @@ private func amp(
   let broken = try amp("corrupt-data", id: "org.example.amp-c", parent: root)
   _ = (declaring, plain, broken)
   let catalog = AmpCatalog(directory: root)
-  #expect(catalog.amps.map(\.id) == ["org.example.amp-a", "org.example.amp-b"])
-  #expect(catalog.error?.contains("has a corrupt IDAT chunk") == true)
-  #expect(catalog.activeAmp?.windowBackground != nil)
+  #expect(
+    catalog.amps.map(\.id) == ["org.example.amp-a", "org.example.amp-b", "org.example.amp-c"])
+  #expect(catalog.error == nil)
+  let first = try #require(catalog.windowBackground)
+  #expect(first.width == 8)
 
   catalog.select(1)
-  #expect(catalog.activeAmp?.windowBackground == nil)
+  #expect(catalog.windowBackground == nil)
   catalog.onSelection = { _ in throw AmpError.message("rejected") }
   catalog.select(0)
-  #expect(catalog.selectedIndex == 1 && catalog.activeAmp?.windowBackground == nil)
+  #expect(catalog.selectedIndex == 1 && catalog.windowBackground == nil)
   catalog.restore(selecting: 0)
-  #expect(catalog.activeAmp?.windowBackground != nil)
+  #expect(catalog.windowBackground != nil && catalog.error == nil)
+  catalog.select(0)
+  #expect(catalog.windowBackground != nil && catalog.error == "rejected")
   catalog.onSelection = nil
   catalog.select(1)
-  #expect(catalog.activeAmp?.windowBackground == nil)
+  #expect(catalog.windowBackground == nil)
+
+  var offered: [String] = []
+  catalog.onSelection = { offered.append($0.id) }
+  catalog.select(2)
+  #expect(catalog.error?.contains("has a corrupt IDAT chunk") == true)
+  #expect(catalog.selectedIndex == 1 && offered.isEmpty)
+  catalog.select(0)
+  #expect(catalog.selectedIndex == 0 && catalog.windowBackground != nil && catalog.error == nil)
+  catalog.restore(selecting: 2)
+  #expect(catalog.selectedIndex == 2 && catalog.windowBackground == nil)
+  #expect(catalog.error?.contains("has a corrupt IDAT chunk") == true)
 
   let empty = root.appendingPathComponent("empty")
-  #expect(AmpCatalog(directory: empty).activeAmp?.windowBackground == nil)
+  #expect(AmpCatalog(directory: empty).windowBackground == nil)
+}
+
+@MainActor
+@Test func aCorruptBackgroundOnTheFirstAmpIsReportedAtLaunch() throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let broken = try amp("corrupt-data", id: "org.example.amp-a", parent: root)
+  let valid = try amp("valid", id: "org.example.amp-b", parent: root)
+  defer { _ = (broken, valid) }
+  let catalog = AmpCatalog(directory: root)
+  #expect(catalog.amps.count == 2 && catalog.selectedIndex == 0)
+  #expect(catalog.windowBackground == nil)
+  #expect(catalog.error?.contains("has a corrupt IDAT chunk") == true)
+  catalog.select(1)
+  #expect(catalog.windowBackground != nil && catalog.error == nil)
 }
 
 /// 80×40 pixels: black ten-pixel top and bottom bands around red, green, blue and white

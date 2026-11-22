@@ -19,12 +19,8 @@ struct TempoControls: View {
   @State private var draft = ""
   @State private var dragStart: Double?
   @FocusState private var focused: Bool
-  @FocusState private var optionsFocused: Bool
 
-  private var pulse: Bool {
-    guard audio.state == .running, let beat = audio.status?.beat else { return false }
-    return beat.truncatingRemainder(dividingBy: 1) < 0.16
-  }
+  private var pulse: Bool { audio.state == .running && audio.beatPulse }
 
   private func setBpm(_ value: Double) {
     guard value.isFinite else { return }
@@ -42,12 +38,7 @@ struct TempoControls: View {
   var body: some View {
     ZStack(alignment: .bottomTrailing) {
       if panel != nil {
-        Color.black.opacity(0.001)
-          .contentShape(Rectangle())
-          .onTapGesture {
-            panel = nil
-          }
-          .accessibilityLabel("Dismiss control options")
+        ControlPanelDismissLayer { panel = nil }
       }
       VStack(alignment: .trailing, spacing: 8) {
         if panel == .tempo { options }
@@ -72,7 +63,7 @@ struct TempoControls: View {
       }.font(Theme.font(metrics.label_font_size))
         .foregroundStyle(panel == .midi ? Theme.primary : Theme.label)
         .accessibilityLabel("MIDI settings and mappings")
-      Divider().frame(height: metrics.icon_size)
+      ControlPillDivider(metrics: metrics)
       Circle().fill(Theme.primary.opacity(pulse ? 1 : 0.25)).frame(width: 5, height: 5)
         .accessibilityHidden(true)
       Group {
@@ -105,7 +96,7 @@ struct TempoControls: View {
       }
       .help("Click to enter BPM; drag vertically to adjust")
       Text("BPM").font(Theme.font(metrics.label_font_size)).foregroundStyle(Theme.secondary)
-      Divider().frame(height: metrics.icon_size)
+      ControlPillDivider(metrics: metrics)
       Button {
         var next = audio.tempo
         next.enabled.toggle()
@@ -125,15 +116,7 @@ struct TempoControls: View {
       }
       .accessibilityLabel("Tempo options")
     }
-    .buttonStyle(.plain)
-    .padding(.horizontal, metrics.horizontal_padding + 4)
-    .frame(height: metrics.control_height + 6)
-    .background(RoundedRectangle(cornerRadius: Theme.panelRadius - 2).fill(Theme.panel))
-    .overlay(
-      RoundedRectangle(cornerRadius: Theme.panelRadius - 2)
-        .strokeBorder(Theme.divider, lineWidth: Theme.borderWidth)
-    )
-    .fixedSize(horizontal: true, vertical: false)
+    .controlPill(metrics)
   }
 
   private var options: some View {
@@ -173,18 +156,6 @@ struct TempoControls: View {
       )
       .font(Theme.font(metrics.label_font_size)).foregroundStyle(Theme.secondary)
     }
-    .uiSize(.compact)
-    .frame(width: 248)
-    .background {
-      // A sibling focus anchor receives initial focus for Escape. Making the panel itself
-      // focusable would report focus to every descendant button through `isFocused`.
-      Color.clear.focusable().focusEffectDisabled().focused($optionsFocused)
-        .accessibilityHidden(true)
-    }
-    .onAppear { optionsFocused = true }
-    .onKeyPress(.escape) {
-      panel = nil
-      return .handled
-    }
+    .controlPanel { panel = nil }
   }
 }

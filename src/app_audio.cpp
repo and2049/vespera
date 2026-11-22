@@ -6,6 +6,10 @@
 #include <vespera/instance_cache.hpp>
 #include <vespera/midi_input.hpp>
 
+#include "offline_render.hpp"
+#include "reamp_job.hpp"
+#include "take_recorder.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -471,6 +475,7 @@ struct AppAudio {
   std::shared_ptr<HostServices> services = HostServices::shared();
   std::shared_ptr<InstanceCache> cache = std::make_shared<InstanceCache>();
   GraphLoader loader;
+  ReampJob reamp;
   AudioSession session;
   AudioSession inspector;
   MidiInput midi;
@@ -559,17 +564,29 @@ struct AppAudio {
     busy.store(true);
     loader.retire(candidate.retiring);
     loader.request_stop();
+    reamp.cancel();
 #if defined(__APPLE__)
     if (pthread_main_np()) {
       using Clock = std::chrono::steady_clock;
       const auto deadline = Clock::now() + std::chrono::seconds(10);
-      while (!loader.stopped() && Clock::now() < deadline) {
+      while ((!loader.stopped() || reamp.rendering()) && Clock::now() < deadline) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.010, false);
       }
     }
 #endif
-    // A running module call can outlast the pump. The worker must still finish before teardown.
+    // A running module call can outlast the pump. The workers must still finish before teardown.
     loader.shutdown();
+    reamp.shutdown();
+#if defined(__APPLE__)
+    // The workers posted the disposal of plugin instances they released to the main run loop.
+    if (pthread_main_np()) {
+      using Clock = std::chrono::steady_clock;
+      const auto deadline = Clock::now() + std::chrono::seconds(1);
+      while (Clock::now() < deadline &&
+             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true) == kCFRunLoopRunHandledSource) {
+      }
+    }
+#endif
     services->set_log_sink(nullptr);
   }
   AppAudio(const AppAudio &) = delete;
@@ -981,19 +998,16 @@ struct AppAudio {
 
   Json status() {
     advance_candidate();
-    if (midi_source) {
-      const auto sources = MidiInput::sources();
-      if (std::none_of(sources.begin(), sources.end(),
-                       [&](const auto &source) { return source.id == midi_source; })) {
-        midi.disconnect();
-        midi_source = 0;
-      }
+    if (midi_source && !MidiInput::source_available(midi_source)) {
+      midi.disconnect();
+      midi_source = 0;
     }
     auto status = session.poll();
     if (status.state == SessionState::running) {
       midi.refresh_generation();
     } else {
       midi.disconnect();
+      session.stop_take();
     }
     if (pending_tempo && status.state == SessionState::running) {
       try {
@@ -1020,6 +1034,7 @@ struct AppAudio {
                 {"beat", session.beat_position()},
                 {"input", {meters.inputs[0].peak, meters.inputs[1].peak}},
                 {"output", {meters.outputs[0].peak, meters.outputs[1].peak}}};
+    result["recording"] = recording_status();
     const auto loader_state = loader.snapshot();
     static constexpr const char *states[] = {"idle",  "queued", "preparing", "waiting",
                                              "ready", "failed", "cancelled", "stopped"};
@@ -1056,6 +1071,7 @@ struct AppAudio {
       }
       result["candidate"]["modules"] = std::move(modules);
     }
+    result["reamp"] = reamp_status();
     if (status.state == SessionState::running || status.state == SessionState::prepared) {
       const auto &info = session.stream_info();
       result["sampleRate"] = info.sample_rate;
@@ -1063,6 +1079,52 @@ struct AppAudio {
       result["latencyFrames"] = info.graph_latency_frames + info.core_io_latency_frames +
                                 status.stream.input_latency_frames +
                                 status.stream.output_latency_frames;
+    }
+    return result;
+  }
+
+  // A take holds the raw device input from a block boundary after the start request to one
+  // after the stop request; closing or reopening the stream, or recovery, ends it. Its sidecar
+  // records the active configuration when recording started.
+  Json record(const Json &j) {
+    const auto action = j.at("action").get<std::string>();
+    if (action == "stop") {
+      session.stop_take();
+      return status();
+    }
+    if (action != "start") {
+      throw std::invalid_argument("Unknown recording action");
+    }
+    const std::filesystem::path path = j.at("path").get<std::string>();
+    if (!path.is_absolute()) {
+      throw std::invalid_argument("Recording path must be absolute");
+    }
+    if (session.state() != SessionState::running) {
+      throw std::runtime_error("Recording requires running audio");
+    }
+    TakeOptions options;
+    options.path = path;
+    options.configuration = active_configuration.dump();
+    options.bpm = tempo.bpm;
+    options.beat = session.beat_position();
+    session.start_take(options);
+    return status();
+  }
+
+  Json recording_status() const {
+    const auto take = session.take_status();
+    Json result{{"state", to_string(take.state)}};
+    if (take.has_take) {
+      result["path"] = take.path.string();
+      result["frames"] = take.frames;
+      result["sampleRate"] = take.sample_rate;
+      result["channels"] = take.channels;
+      result["droppedFrames"] = take.dropped_frames;
+    }
+    if (take.state == TakeState::failed) {
+      result["error"] = take.error;
+    } else if (take.state == TakeState::idle && take.end == TakeEnd::full) {
+      result["stopReason"] = "full";
     }
     return result;
   }
@@ -1210,34 +1272,71 @@ struct AppAudio {
     auto graph = std::make_unique<Graph>();
     populate(*graph, j.at("configuration"),
              HostServices::create({HostWorkMode::synchronous, 0, false}));
-    graph->prepare(Format{static_cast<double>(sample_rate), block_size, channels});
     std::vector<std::vector<float>> output(channels, std::vector<float>(frames));
-    for (size_t offset = 0; offset < frames; offset += block_size) {
-      const auto count = static_cast<uint32_t>(std::min<size_t>(block_size, frames - offset));
-      std::array<const float *, 2> inputs{};
-      std::array<float *, 2> outputs{};
-      for (uint32_t c = 0; c < channels; ++c) {
-        inputs[c] = source[c].data() + offset;
-        outputs[c] = output[c].data() + offset;
+    uint32_t latency = 0;
+    {
+      OfflineRenderer renderer(
+          *graph, {static_cast<double>(sample_rate), block_size, channels, channels, bpm, {}});
+      for (size_t offset = 0; offset < frames; offset += block_size) {
+        const auto count = static_cast<uint32_t>(std::min<size_t>(block_size, frames - offset));
+        std::array<const float *, 2> inputs{};
+        std::array<float *, 2> outputs{};
+        for (uint32_t c = 0; c < channels; ++c) {
+          inputs[c] = source[c].data() + offset;
+          outputs[c] = output[c].data() + offset;
+        }
+        renderer.process(inputs.data(), outputs.data(), count);
       }
-      vs_tempo_context timing{sizeof(vs_tempo_context),
-                              VS_TEMPO_VALID | (offset == 0 ? VS_TEMPO_DISCONTINUITY : 0u), bpm,
-                              static_cast<double>(offset) * bpm / (60.0 * sample_rate)};
-      Block block{inputs.data(),
-                  outputs.data(),
-                  channels,
-                  count,
-                  offset,
-                  VS_PROCESS_OFFLINE | (offset == 0 ? uint32_t{VS_PROCESS_DISCONTINUITY} : 0u),
-                  &timing};
-      if (const auto result = graph->process(block); result != VS_OK) {
-        throw std::runtime_error("Offline render failed at frame " + std::to_string(offset) + " (" +
-                                 std::to_string(result) + ")");
-      }
+      latency = graph->latency_frames();
     }
-    const auto latency = graph->latency_frames();
-    graph->release();
     return {{"output", output}, {"latencyFrames", latency}};
+  }
+
+  // The render's output path while it has one, its peak once it is producing output and its
+  // error once it failed.
+  Json reamp_status() const {
+    const auto job = reamp.snapshot();
+    Json result{{"state", to_string(job.state)}, {"progress", job.progress}};
+    if (job.state != ReampJob::State::idle) {
+      result["output"] = job.output.string();
+    }
+    if (job.state == ReampJob::State::rendering || job.state == ReampJob::State::done) {
+      result["peak"] = job.peak;
+    }
+    if (job.state == ReampJob::State::failed) {
+      result["error"] = job.error;
+    }
+    return result;
+  }
+
+  // Renders a recorded input file through a new graph built from the configuration exactly as
+  // renderGraph builds one, on the reamp worker, through the live session's core IO stages and
+  // stereo graph at the file's sample rate. The running session is untouched.
+  Json reamp_request(const Json &j) {
+    const auto action = j.at("action").get<std::string>();
+    if (action == "cancel") {
+      reamp.cancel();
+      return reamp_status();
+    }
+    if (action != "start") {
+      throw std::invalid_argument("Unknown reamp action");
+    }
+    if (reamp.rendering()) {
+      throw std::logic_error("A reamp render is already running");
+    }
+    const auto rig = j.at("configuration");
+    validate_configuration(rig);
+    ReampJob::Request request;
+    request.input = j.at("input").get<std::string>();
+    request.output = j.at("output").get<std::string>();
+    request.core_io = core_settings(rig.value("globals", Json::object()));
+    request.bpm = j.value("bpm", 120.0);
+    request.block_size = j.value("blockSize", 128u);
+    request.populate = [this, rig](Graph &graph) {
+      populate(graph, rig, HostServices::create({HostWorkMode::synchronous, 0, false}));
+    };
+    reamp.start(std::move(request));
+    return reamp_status();
   }
 
   // A parameter of a configuration that is still travelling toward the graph: the value joins
@@ -1350,12 +1449,8 @@ struct AppAudio {
       if (channel > 16) {
         throw std::invalid_argument("Invalid MIDI channel");
       }
-      if (source) {
-        const auto sources = MidiInput::sources();
-        if (std::none_of(sources.begin(), sources.end(),
-                         [&](const auto &entry) { return entry.id == source; })) {
-          throw std::invalid_argument("MIDI source is unavailable");
-        }
+      if (source && !MidiInput::source_available(source)) {
+        throw std::invalid_argument("MIDI source is unavailable");
       }
       const auto previous_source = midi_source;
       const auto previous_channel = midi_channel;
@@ -1384,6 +1479,9 @@ struct AppAudio {
     }
     if (op == "status") {
       return status();
+    }
+    if (op == "record") {
+      return record(j);
     }
     if (op == "cancelCandidate") {
       loader.cancel();
@@ -1508,6 +1606,9 @@ struct AppAudio {
     }
     if (op == "renderGraph") {
       return render_graph(j);
+    }
+    if (op == "reamp") {
+      return reamp_request(j);
     }
     if (op == "globals") {
       auto settings = core_settings(j.at("globals"));

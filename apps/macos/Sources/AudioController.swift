@@ -107,6 +107,8 @@ struct AudioStatus: Decodable {
   /// Modules of the running graph whose status is not ready.
   let modules: [ModuleRuntimeStatus]?
   let candidate: CandidatePreparationStatus?
+  var recording: RecordingStatus? = nil
+  var reamp: ReampStatus? = nil
 }
 
 struct CandidatePreparationStatus: Decodable {
@@ -128,7 +130,7 @@ struct CandidatePreparationStatus: Decodable {
       }
     }
 
-    var isCancellable: Bool {
+    var isPreparing: Bool {
       switch self {
       case .queued, .preparing, .waiting: true
       case .unknown: false
@@ -141,6 +143,95 @@ struct CandidatePreparationStatus: Decodable {
   let state: State
   let error: String
   let modules: [ModuleRuntimeStatus]?
+}
+
+/// What the rig-change indicators show about the latest replacement rig.
+enum RigPreparation: Equatable {
+  case none
+  /// On its way; the bridge activates it during the first status request after it is prepared.
+  case preparing
+  case failed(String)
+
+  init(_ candidate: CandidatePreparationStatus?) {
+    if let candidate, !candidate.error.isEmpty {
+      self = .failed(candidate.error)
+    } else if candidate?.state.isPreparing == true {
+      self = .preparing
+    } else {
+      self = .none
+    }
+  }
+}
+
+/// Input and output peak levels, published separately from the controller so the meters redraw
+/// without the rest of the window.
+@MainActor
+final class MeterLevels: ObservableObject {
+  @Published private(set) var input: [Float] = [0, 0]
+  @Published private(set) var output: [Float] = [0, 0]
+
+  /// Levels below −60 dBFS draw nothing, so decaying peaks settle to exactly zero there.
+  static let floor: Float = 0.001
+  /// A held peak falls to 0.8 of its level every thirtieth of a second, however often levels
+  /// arrive.
+  static func decay(after seconds: TimeInterval) -> Float {
+    Float(pow(0.8, max(0, seconds) * 30))
+  }
+
+  private var updated: TimeInterval?
+
+  /// Takes new peaks measured at `time` (seconds on a monotonic clock), holding previous ones as
+  /// they decay.
+  func update(
+    input peaks: [Float], output outputPeaks: [Float],
+    at time: TimeInterval = ProcessInfo.processInfo.systemUptime
+  ) {
+    let factor = updated.map { Self.decay(after: time - $0) } ?? 0
+    updated = time
+    func held(_ peaks: [Float], _ previous: [Float]) -> [Float] {
+      zip(peaks, previous).map { peak, previous in
+        let level = max(peak, previous * factor)
+        return level < Self.floor ? 0 : level
+      }
+    }
+    set(held(peaks, input), output: held(outputPeaks, output))
+  }
+
+  func reset() {
+    updated = nil
+    set([0, 0], output: [0, 0])
+  }
+
+  private func set(_ input: [Float], output: [Float]) {
+    if input != self.input { self.input = input }
+    if output != self.output { self.output = output }
+  }
+}
+
+/// How often the controller polls the audio bridge.
+enum PollCadence: Equatable {
+  /// Audio is stopped and nothing needs live status.
+  case idle
+  /// Meters, takes, reamps or MIDI mappings need status at the meter rate.
+  case running
+  /// A replacement rig is pending; only a status request activates it once it is prepared, so
+  /// polling every few milliseconds keeps the switch from waiting for the next meter tick.
+  case switching
+
+  var interval: TimeInterval {
+    switch self {
+    case .idle: 1 / 4
+    case .running: 1 / 30
+    case .switching: 1 / 200
+    }
+  }
+
+  static func required(audioRunning: Bool, switchPending: Bool, needsStatus: Bool)
+    -> PollCadence
+  {
+    if audioRunning { return switchPending ? .switching : .running }
+    return needsStatus ? .running : .idle
+  }
 }
 
 /// A status a running module reports through host services, for the bridge slot it fills.
@@ -203,9 +294,13 @@ final class AudioController: ObservableObject {
   @Published private(set) var globals = GlobalControlSettings()
   @Published private(set) var tempo = TempoSettings()
   private let moduleTiming = ModuleTiming()
-  @Published private(set) var inputLevels: [Float] = [0, 0]
-  @Published private(set) var outputLevels: [Float] = [0, 0]
-  @Published private(set) var status: AudioStatus?
+  let meters = MeterLevels()
+  /// The latest bridge status. Not published: it changes with every poll, so views observe the
+  /// values derived from it, which change only when what they show does.
+  private(set) var status: AudioStatus?
+  @Published private(set) var rigPreparation = RigPreparation.none
+  /// Whether the metronome indicator is lit, near the start of each beat.
+  @Published private(set) var beatPulse = false
   /// Statuses the running modules report, from the latest bridge status.
   @Published private(set) var moduleStatuses: [ModuleRuntimeStatus] = []
   @Published var error: String?
@@ -224,6 +319,7 @@ final class AudioController: ObservableObject {
       }
       defaults.set(
         try? JSONEncoder().encode(midiMappings), forKey: "audio.midiMappings")
+      updateCadence()
     }
   }
   private let mappingInput = MIDIMappingInput()
@@ -233,9 +329,18 @@ final class AudioController: ObservableObject {
   /// stored once and never overwritten.
   static let mappingsBeforeRelocationKey = "audio.midiMappings.beforeSpecialFXRelocation"
   private var bridge: AudioBridge?
-  private var timer: Timer?
+  private enum Polling {
+    case notStarted
+    case active(PollCadence, Timer)
+    case shutDown
+  }
+  private var polling = Polling.notStarted
+  /// A replacement the bridge reported pending in a reply, until the next status supersedes it.
+  private var pendingSwitch: CandidatePreparationStatus?
+  /// `takes.needsStatus` as last published; read while the takes controller is mid-change.
+  private var takesNeedStatus = false
   /// Global-control changes are not sent as they happen: the latest settings wait here and go
-  /// out with the next 30 Hz status poll, so a burst of knob turns collapses into one request.
+  /// out with the next status poll, so a burst of knob turns collapses into one request.
   /// Starting audio or loading a preset clears this, because their requests already carry the
   /// global controls.
   private var pendingGlobals: GlobalControlSettings?
@@ -246,8 +351,7 @@ final class AudioController: ObservableObject {
       self.mappingCoordinator.releaseGates()
       _ = try self.bridge?.request(.stop)
       self.transition(to: .suspended)
-      self.inputLevels = [0, 0]
-      self.outputLevels = [0, 0]
+      self.meters.reset()
     },
     resume: { [weak self] in
       guard let self else { return }
@@ -299,6 +403,33 @@ final class AudioController: ObservableObject {
   private var rigObservers: [AnyCancellable] = []
   /// Submits a staged preset to the audio side; throwing rejects it. Replaceable for tests.
   var submitPreset: (([String: Any]) throws -> Void)?
+  /// Sends a record or reamp request to the audio side and returns its value. Replaceable for
+  /// tests.
+  var submitTakeRequest: (([String: Any]) throws -> Data)?
+  private let takeDirectory: URL
+  private let takeTemporaryDirectory: URL
+  private let takePrompts: TakeController.Prompts
+  /// Input recording and offline rendering through the current rig.
+  private(set) lazy var takes = TakeController(
+    directory: takeDirectory, temporaryDirectory: takeTemporaryDirectory, defaults: defaults,
+    prompts: takePrompts,
+    request: { [weak self] request in
+      guard let self else { throw AmpError.message("Audio backend is unavailable.") }
+      if let submit = self.submitTakeRequest { return try submit(request) }
+      guard let bridge = self.bridge else {
+        throw AmpError.message("Audio backend is unavailable.")
+      }
+      return try bridge.request(request)
+    },
+    isAudioRunning: { [weak self] in self?.state == .running },
+    configuration: { [weak self] in
+      guard let self else { throw AmpError.message("Audio backend is unavailable.") }
+      return try self.startConfiguration()
+    },
+    bpm: { [weak self] in self?.tempo.bpm ?? TempoSettings().bpm },
+    blockSize: { [weak self] in Int(self?.configuration.bufferSize ?? 128) },
+    report: { [weak self] error in self?.report(error) },
+    notify: { [weak self] message in self?.notice = message })
   private static let decoder = JSONDecoder()
 
   var inputDevice: AudioDeviceInfo? { devices.first { $0.id == configuration.inputDevice } }
@@ -311,9 +442,14 @@ final class AudioController: ObservableObject {
     amps: AmpCatalog = AmpCatalog(), preFX: PedalCatalog = PedalCatalog(),
     postFX: PedalCatalog = PedalCatalog(position: .post),
     cabinets: CabinetCatalog = CabinetCatalog(), specialFX: SpecialFXCatalog = SpecialFXCatalog(),
-    defaults: UserDefaults = .standard
+    defaults: UserDefaults = .standard, takeDirectory: URL = TakeController.standardDirectory,
+    takeTemporaryDirectory: URL = FileManager.default.temporaryDirectory,
+    takePrompts: TakeController.Prompts = .standard
   ) {
     self.defaults = defaults
+    self.takeDirectory = takeDirectory
+    self.takeTemporaryDirectory = takeTemporaryDirectory
+    self.takePrompts = takePrompts
     self.amps = amps
     self.cabinets = cabinets
     self.preFX = preFX
@@ -395,7 +531,7 @@ final class AudioController: ObservableObject {
       guard let self else { return }
       self.rigEdited()
       guard self.state == .running else { return }
-      _ = try self.bridge?.request(try Self.rigRequest(amp: amp, cabinet: cabinet))
+      try self.requestRigChange(try Self.rigRequest(amp: amp, cabinet: cabinet))
     }
     do { try cabinets.setAmp(amps.activeAmp) } catch { report(error) }
     amps.onSelection = { [weak self] amp in try self?.cabinets.setAmp(amp) }
@@ -411,7 +547,7 @@ final class AudioController: ObservableObject {
     specialFX.onChange = { [weak self] modules in
       self?.rigEdited()
       guard let self, self.state == .running else { return }
-      _ = try self.bridge?.request(.specialFX, ["modules": modules])
+      try self.requestRigChange(["op": BridgeOp.specialFX.rawValue, "modules": modules])
     }
     for module in specialFX.modules {
       module.timing = moduleTiming
@@ -428,7 +564,7 @@ final class AudioController: ObservableObject {
       catalog.onChange = { [weak self] modules in
         self?.rigEdited()
         guard let self, self.state == .running else { return }
-        _ = try self.bridge?.request(operation, ["modules": modules])
+        try self.requestRigChange(["op": operation.rawValue, "modules": modules])
       }
       catalog.onParameterChange = { [weak self] slot, id, value in
         self?.rigEdited()
@@ -453,6 +589,13 @@ final class AudioController: ObservableObject {
       preFX.objectWillChange, postFX.objectWillChange,
     ]
     rigObservers = publishers.map { $0.sink { [weak self] in self?.rigEdited() } }
+    rigObservers.append(
+      takes.needsStatusPublisher.sink { [weak self] needed in
+        MainActor.assumeIsolated {
+          self?.takesNeedStatus = needed
+          self?.updateCadence()
+        }
+      })
     for module in amps.amps.flatMap({ [$0] + ($0.equalizer.map { [$0] } ?? []) })
       + cabinets.cabinets + specialFX.modules
     {
@@ -471,9 +614,51 @@ final class AudioController: ObservableObject {
   /// The recurring bridge poll and the sleep/wake recovery watcher.
   private func startPolling() {
     _ = powerRecovery
-    timer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
+    guard case .notStarted = polling else { return }
+    schedulePoll(requiredCadence)
+  }
+
+  /// The cadence the bridge is polled at; nil before polling starts and after shutdown.
+  var pollCadence: PollCadence? {
+    if case .active(let cadence, _) = polling { return cadence }
+    return nil
+  }
+
+  private var requiredCadence: PollCadence {
+    PollCadence.required(
+      audioRunning: state == .running,
+      switchPending: RigPreparation(pendingSwitch ?? status?.candidate) == .preparing,
+      needsStatus: takesNeedStatus || (midiSource != 0 && !midiMappings.isEmpty))
+  }
+
+  /// Reschedules the poll when what needs it has changed; called after every change that can
+  /// alter `requiredCadence`.
+  private func updateCadence() {
+    guard case .active(let current, _) = polling, requiredCadence != current else { return }
+    schedulePoll(requiredCadence)
+  }
+
+  private func schedulePoll(_ cadence: PollCadence) {
+    if case .active(_, let previous) = polling { previous.invalidate() }
+    let timer = Timer(timeInterval: cadence.interval, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.poll() }
     }
+    timer.tolerance = cadence.interval / 10
+    RunLoop.main.add(timer, forMode: .default)
+    polling = .active(cadence, timer)
+  }
+
+  /// Sends a request that can start replacing the rig. Its reply is the audio status, so a
+  /// pending replacement switches polling to the fast cadence at once.
+  private func requestRigChange(_ request: [String: Any]) throws {
+    guard let bridge else { return }
+    let reply = try bridge.request(request)
+    struct Reply: Decodable { let candidate: CandidatePreparationStatus? }
+    guard let candidate = try? Self.decoder.decode(Reply.self, from: reply).candidate,
+      RigPreparation(candidate) == .preparing
+    else { return }
+    pendingSwitch = candidate
+    updateCadence()
   }
 
   private func report(_ error: Error) { self.error = error.localizedDescription }
@@ -491,7 +676,10 @@ final class AudioController: ObservableObject {
 
   /// The one way `state` changes: start passes through requestingPermission into running; a
   /// sleep suspends and a wake recovers; any failure ends in failed; stop ends in stopped.
-  private func transition(to next: State) { state = next }
+  private func transition(to next: State) {
+    state = next
+    updateCadence()
+  }
 
   // MARK: Devices
 
@@ -552,6 +740,7 @@ final class AudioController: ObservableObject {
   // MARK: Audio lifecycle
 
   func start() {
+    if case .shutDown = polling { return }
     guard state != .requestingPermission, !powerRecovery.isSleeping else { return }
     switch AVCaptureDevice.authorizationStatus(for: .audio) {
     case .authorized:
@@ -620,15 +809,14 @@ final class AudioController: ObservableObject {
       report(error)
       transition(to: .failed)
     }
-    inputLevels = [0, 0]
-    outputLevels = [0, 0]
+    meters.reset()
   }
 
   func shutdown() {
     powerRecovery.shutdown()
+    if case .active(_, let timer) = polling { timer.invalidate() }
+    polling = .shutDown
     stop()
-    timer?.invalidate()
-    timer = nil
     deviceStore.stop()
   }
 
@@ -636,7 +824,14 @@ final class AudioController: ObservableObject {
     powerRecovery.poll()
     guard !powerRecovery.isPending else { return }
     pollMappings()
-    guard state == .running, let bridge else { return }
+    guard let bridge else { return }
+    guard state == .running else {
+      guard takes.needsStatus else { return }
+      do {
+        takes.apply(try Self.decoder.decode(AudioStatus.self, from: bridge.request(.status)))
+      } catch { report(error) }
+      return
+    }
     do {
       if let pendingGlobals {
         _ = try bridge.request(.globals, ["globals": try AudioBridge.object(pendingGlobals)])
@@ -648,23 +843,29 @@ final class AudioController: ObservableObject {
       if midiSource != current.midiSource ?? 0 {
         mappingCoordinator.releaseGates()
         midiSource = current.midiSource ?? 0
+        updateCadence()
         try mappingInput.connect(midiSource)
       }
       moduleTiming.beat = current.beat ?? 0
-      inputLevels = zip(current.input, inputLevels).map { max($0, $1 * 0.8) }
-      outputLevels = zip(current.output, outputLevels).map { max($0, $1 * 0.8) }
+      meters.update(input: current.input, output: current.output)
       if current.state != .running && !(current.state == .prepared && current.candidate != nil) {
         transition(to: .failed)
         error =
           "Audio stopped: \(current.recovery) (\(current.lastError)). Check Audio Settings and restart."
-        inputLevels = [0, 0]
-        outputLevels = [0, 0]
+        meters.reset()
       }
     } catch { report(error) }
   }
 
   func apply(status current: AudioStatus) {
     status = current
+    pendingSwitch = nil
+    let preparation = RigPreparation(current.candidate)
+    if preparation != rigPreparation { rigPreparation = preparation }
+    let pulse = current.beat.map { $0.truncatingRemainder(dividingBy: 1) < 0.16 } ?? false
+    if pulse != beatPulse { beatPulse = pulse }
+    updateCadence()
+    takes.apply(current)
     let modules = current.candidate?.modules ?? current.modules ?? []
     if modules != moduleStatuses { moduleStatuses = modules }
     var selected: [(String, LoadedModule)] = []
@@ -756,8 +957,8 @@ final class AudioController: ObservableObject {
   private func submit(_ request: [String: Any]) throws {
     if let submitPreset { return try submitPreset(request) }
     guard state == .running else { return }
-    guard let bridge else { throw AmpError.message("Audio backend is unavailable.") }
-    _ = try bridge.request(request)
+    guard bridge != nil else { throw AmpError.message("Audio backend is unavailable.") }
+    try requestRigChange(request)
   }
 
   /// The preset request describing what is currently shown, used to restore the audio side.
@@ -774,27 +975,13 @@ final class AudioController: ObservableObject {
 
   func dismissNotice() { notice = nil }
 
-  var preparationMessage: String? {
-    guard let candidate = status?.candidate else { return nil }
-    if !candidate.error.isEmpty { return candidate.error }
-    switch candidate.state {
-    case .queued, .preparing: return "Preparing rig…"
-    case .waiting: return "Loading rig…"
-    case .unknown: return nil
-    }
-  }
+  /// A replacement rig is being prepared or loaded while the previous one keeps playing.
+  var isPreparingRig: Bool { rigPreparation == .preparing }
 
-  var canCancelPreparation: Bool {
-    guard let candidate = status?.candidate else { return false }
-    return candidate.state.isCancellable
-  }
-
-  func cancelPreparation() {
-    do {
-      guard let bridge else { return }
-      let data = try bridge.request(.cancelCandidate)
-      apply(status: try Self.decoder.decode(AudioStatus.self, from: data))
-    } catch { report(error) }
+  /// Why the last replacement rig did not load.
+  var preparationError: String? {
+    guard case .failed(let error) = rigPreparation else { return nil }
+    return error
   }
 
   /// The modules shown on a tab whose status is not ready, named as the user knows them.
@@ -841,6 +1028,7 @@ final class AudioController: ObservableObject {
       midiSource = source
       midiChannel = channel
       mappingCoordinator.releaseGates()
+      updateCadence()
     } catch { report(error) }
   }
 

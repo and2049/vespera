@@ -9,13 +9,16 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <concepts>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -240,7 +243,7 @@ struct AudioUnitSetting {
 
 // Revision of the shared engine implementation below. Part of every engine identity, so modules
 // built against different engine code never share an instance.
-inline constexpr uint32_t shared_engine_revision = 1;
+inline constexpr uint32_t shared_engine_revision = 2;
 
 // While the route parameter selects `route`, module parameter `parameter` writes `value` (in
 // Audio Unit units) to its target instead of its own mapped value.
@@ -305,7 +308,19 @@ struct RoutePin {
  * Optional preparation_seconds (0..1) renders silence after initialization and before frame zero,
  * without resetting afterwards or increasing reported latency. It runs only during preparation;
  * the host tempo is not known until processing begins. All members of a shared run must use the
- * same policy; it participates in engine and cache identity.
+ * same policy; it participates in engine and cache identity. Preparation runs outside the
+ * lifecycle lock.
+ * Optional preparation_in_real_time, for plugins whose startup work on the main thread must
+ * overlap rendering, renders a fresh instance's preparation_seconds no faster than playback off
+ * the main thread, then gives the instance again any parameter values that work reverted and
+ * prepares again, failing after three attempts. Cached instances and the main thread, where that
+ * work cannot run during preparation, prepare at full speed. Optional preparation_paced_seconds
+ * (0 < value <= preparation_seconds) paces only that leading part; the rest renders at full
+ * speed, so the rendered length is unchanged. Both participate in engine and cache identity.
+ * Verification covers only the values the wrapper wrote while preparing, within the plugin's
+ * representation of them (see holds), and gives again only those it no longer holds.
+ * Instances released off the main thread are disposed on it, where hosted plugins handle their
+ * message-thread work, through a posted job that pins this library.
  * Optional main_thread_lifecycle runs creation and disposal on main and disables caching.
  * The lifecycle lock serializes AU calls, not instance lifetimes: deferred teardown may run
  * after a later inline creation or a job from another library.
@@ -315,7 +330,7 @@ struct RoutePin {
  *
  * Idle instances go to the host's vs_host_instance_cache when it offers one, keyed by component
  * and instance policy variant, preparation policy and channel count; the cache disposes them
- * through this module under the plugin lifecycle lock.
+ * through this module on the main thread under the plugin lifecycle lock.
  */
 template <class Configuration> class AudioUnitModule {
   static constexpr bool accepts_midi = [] {
@@ -382,6 +397,27 @@ template <class Configuration> class AudioUnitModule {
     }
     return false;
   }();
+  static constexpr bool realtime_preparation = [] {
+    if constexpr (requires { Configuration::preparation_in_real_time; }) {
+      return bool(Configuration::preparation_in_real_time);
+    }
+    return false;
+  }();
+  static_assert(!realtime_preparation || preparation_seconds > 0,
+                "preparation_in_real_time requires preparation_seconds");
+  static constexpr double paced_seconds = [] {
+    if constexpr (requires { Configuration::preparation_paced_seconds; }) {
+      return double{Configuration::preparation_paced_seconds};
+    } else {
+      return preparation_seconds;
+    }
+  }();
+  static_assert(
+      !requires { Configuration::preparation_paced_seconds; } ||
+          (realtime_preparation && paced_seconds > 0 && paced_seconds <= preparation_seconds),
+      "preparation_paced_seconds requires preparation_in_real_time and lies within "
+      "(0, preparation_seconds]");
+  static constexpr int preparation_attempts = 3;
   static constexpr bool custom_prepare =
       requires(Preparation &p) { Configuration::prepare_instance(p); };
   static_assert(
@@ -405,7 +441,9 @@ template <class Configuration> class AudioUnitModule {
   }();
   // An optional `instance_policy` object adjusts every acquired or reused instance through
   // `configure(AudioUnit, uint32_t channels)` and names that adjustment in `variant()` so
-  // differently configured instances never share a cache entry.
+  // differently configured instances never share a cache entry. A policy may also declare
+  // `verify(AudioUnit, uint32_t channels)`, which then checks a reused instance instead of
+  // configuring it again: the cache keeps instances per variant and channel count.
   static constexpr bool policed = requires { Configuration::instance_policy; };
   static constexpr bool shared = requires {
     Configuration::shared_engine;
@@ -632,6 +670,9 @@ template <class Configuration> class AudioUnitModule {
     if constexpr (preparation_seconds > 0) {
       key += "|settle=" + std::to_string(std::bit_cast<uint64_t>(preparation_seconds));
     }
+    if constexpr (realtime_preparation) {
+      key += "|paced=" + std::to_string(std::bit_cast<uint64_t>(paced_seconds));
+    }
     if constexpr (main_lifecycle) {
       key += "|main-lifecycle";
     }
@@ -655,6 +696,9 @@ template <class Configuration> class AudioUnitModule {
   CFDataRef defaults_ = nullptr;
   // False when a section of the engine keeps audio across Reset (VS_SHARED_RETAINS_AUDIO).
   bool reusable_ = true;
+  bool fresh_ = false;
+  // The last value written to each target while preparing, for real-time preparation to verify.
+  std::vector<vs_shared_assignment> intended_;
   std::array<std::array<bool, 128>, 16> held_notes_{};
   struct CallbackState {
     uint32_t channels = 0;
@@ -738,31 +782,112 @@ template <class Configuration> class AudioUnitModule {
     return validate(parameter.id, parameter.name, parameter.minimum, parameter.maximum);
   }
 
-  // Global parameter values of a freshly configured instance, so a reused instance can start
-  // from the same values whatever its previous owner changed.
-  CFDataRef capture_defaults() const {
+  bool parameter_values(std::vector<vs_shared_assignment> &values) const {
+    values.clear();
     UInt32 size = 0;
     if (AudioUnitGetPropertyInfo(unit_, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0,
                                  &size, nullptr) != noErr) {
-      return nullptr;
+      return false;
     }
     std::vector<AudioUnitParameterID> ids(size / sizeof(AudioUnitParameterID));
     if (!ids.empty() &&
         AudioUnitGetProperty(unit_, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0,
                              ids.data(), &size) != noErr) {
-      return nullptr;
+      return false;
     }
-    std::vector<vs_shared_assignment> values;
     values.reserve(ids.size());
     for (auto id : ids) {
       AudioUnitParameterValue value = 0;
       if (AudioUnitGetParameter(unit_, id, kAudioUnitScope_Global, 0, &value) != noErr) {
-        return nullptr;
+        return false;
       }
       values.push_back({id, value});
     }
+    return true;
+  }
+
+  // Global parameter values of a freshly configured instance, so a reused instance can start
+  // from the same values whatever its previous owner changed.
+  CFDataRef capture_defaults() const {
+    std::vector<vs_shared_assignment> values;
+    if (!parameter_values(values)) {
+      return nullptr;
+    }
     return CFDataCreate(nullptr, reinterpret_cast<const UInt8 *>(values.data()),
                         static_cast<CFIndex>(values.size() * sizeof(vs_shared_assignment)));
+  }
+
+  // Gives the instance a value, remembering it while preparing for real-time verification.
+  bool write_target(AudioUnitParameterID target, float value) {
+    if (AudioUnitSetParameter(unit_, target, kAudioUnitScope_Global, 0, value, 0) != noErr) {
+      return false;
+    }
+    if constexpr (realtime_preparation) {
+      if (state_ != State::prepared) {
+        const auto found = std::find_if(intended_.begin(), intended_.end(),
+                                        [&](const auto &entry) { return entry.target == target; });
+        if (found == intended_.end()) {
+          intended_.push_back({target, value});
+        } else {
+          found->value = value;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Whether a plugin holding `actual` still holds the written `intended`, as it represents
+  // values: clamped to the parameter's range, any index less than one step away for indexed and
+  // boolean parameters (it may round or truncate), and within single-precision normalization
+  // error of the range otherwise.
+  static bool holds(const AudioUnitParameterInfo &info, float intended, float actual) {
+    if (!std::isfinite(actual)) {
+      return false;
+    }
+    const auto low = std::min(info.minValue, info.maxValue);
+    const auto high = std::max(info.minValue, info.maxValue);
+    const double expected = std::clamp(intended, low, high);
+    const double difference = std::abs(double(actual) - expected);
+    if (info.unit == kAudioUnitParameterUnit_Indexed ||
+        info.unit == kAudioUnitParameterUnit_Boolean) {
+      return difference < 1;
+    }
+    return difference <= (double(high) - low) * 1e-5;
+  }
+
+  enum class Verification { kept, reverted, unreadable };
+  struct Difference {
+    AudioUnitParameterID target;
+    float intended;
+    float actual;
+  };
+
+  // Compares every value written while preparing with what the plugin holds now. Some plugins
+  // revert their parameters to their own defaults from work they queue on the main thread at
+  // startup; parameters the wrapper never wrote are not its concern.
+  Verification verify_intended(std::vector<Difference> &differences) const {
+    differences.clear();
+    for (const auto &entry : intended_) {
+      AudioUnitParameterInfo info{};
+      UInt32 size = sizeof(info);
+      AudioUnitParameterValue actual = 0;
+      const bool described =
+          AudioUnitGetProperty(unit_, kAudioUnitProperty_ParameterInfo, kAudioUnitScope_Global,
+                               entry.target, &info, &size) == noErr;
+      if (described && (info.flags & kAudioUnitParameterFlag_HasCFNameString) &&
+          (info.flags & kAudioUnitParameterFlag_CFNameRelease) && info.cfNameString) {
+        CFRelease(info.cfNameString);
+      }
+      if (!described ||
+          AudioUnitGetParameter(unit_, entry.target, kAudioUnitScope_Global, 0, &actual) != noErr) {
+        differences = {{entry.target, entry.value, 0}};
+        return Verification::unreadable;
+      }
+      if (!holds(info, entry.value, actual)) {
+        differences.push_back({entry.target, entry.value, actual});
+      }
+    }
+    return differences.empty() ? Verification::kept : Verification::reverted;
   }
 
   bool restore_defaults() const {
@@ -784,6 +909,10 @@ template <class Configuration> class AudioUnitModule {
     return true;
   }
 
+  static constexpr bool verified_on_reuse = requires(AudioUnit unit) {
+    { Configuration::instance_policy.verify(unit, uint32_t{}) } -> std::convertible_to<bool>;
+  };
+
   // Obtains an instance in its configured channel mode with default parameter values, reusing a
   // cached one when the host offers it.
   vs_result acquire(uint32_t channels, bool &reused) {
@@ -796,7 +925,11 @@ template <class Configuration> class AudioUnitModule {
       defaults_ = static_cast<CFDataRef>(payload);
       if (unit_) {
         reused = true;
-        if constexpr (policed) {
+        if constexpr (verified_on_reuse) {
+          if (!Configuration::instance_policy.verify(unit_, channels)) {
+            return VS_ERROR_UNSUPPORTED;
+          }
+        } else if constexpr (policed) {
           if (!Configuration::instance_policy.configure(unit_, channels)) {
             return VS_ERROR_UNSUPPORTED;
           }
@@ -826,49 +959,76 @@ template <class Configuration> class AudioUnitModule {
     return VS_OK;
   }
 
-  // Disposes an instance with its defaults snapshot on behalf of the host cache. Without the
-  // lifecycle lock the instance is abandoned rather than disposed unserialized.
+  // Uninitializes and disposes an instance, then frees what it referenced, on the main thread:
+  // plugins built on JUCE post message-thread work referencing the instance, and disposing it on
+  // another thread lets that work run on a destroyed instance. Off the main thread the work is
+  // posted, which pins this library until it has run. Without the lifecycle lock the instance and
+  // what it references are abandoned rather than disposed unserialized. The main thread never
+  // waits for the lock: while another thread holds it, for example creating a plugin, the
+  // disposal is retried later from a main run-loop timer.
+  struct Disposal {
+    AudioUnit unit;
+    CFDataRef defaults;
+    CallbackState *callbacks;
+    double retry_seconds = .002;
+
+    void operator()() {
+      PluginLifecycleLock lock(std::try_to_lock);
+      switch (unit ? lock.acquisition() : PluginLifecycleLock::Acquisition::held) {
+      case PluginLifecycleLock::Acquisition::busy: {
+        auto later = *this;
+        later.retry_seconds = std::min(retry_seconds * 2, .05);
+        if (!MainThread::post_after(retry_seconds, later)) {
+          std::fputs("Audio Unit: could not queue main-thread disposal\n", stderr);
+        }
+        return;
+      }
+      case PluginLifecycleLock::Acquisition::failed:
+        return;
+      case PluginLifecycleLock::Acquisition::held:
+        if (unit && (AudioUnitUninitialize(unit), AudioComponentInstanceDispose(unit) != noErr)) {
+          return;
+        }
+        delete callbacks;
+        if (defaults) {
+          CFRelease(defaults);
+        }
+        return;
+      }
+    }
+  };
+
+  static void dispose_on_main(AudioUnit unit, CFDataRef defaults, CallbackState *callbacks) {
+    Disposal disposal{unit, defaults, callbacks};
+    if (!unit || MainThread::on_main()) {
+      disposal();
+    } else if (!MainThread::post(disposal)) {
+      std::fputs("Audio Unit: could not queue main-thread disposal\n", stderr);
+    }
+  }
+
+  // Disposes an instance with its defaults snapshot on behalf of the host cache.
   static void dispose_for_cache(void *instance, void *payload) {
-    PluginLifecycleLock lock;
-    if (!lock) {
-      return;
-    }
-    AudioComponentInstanceDispose(static_cast<AudioUnit>(instance));
-    if (payload) {
-      CFRelease(static_cast<CFTypeRef>(payload));
-    }
+    dispose_on_main(static_cast<AudioUnit>(instance), static_cast<CFDataRef>(payload), nullptr);
+  }
+
+  // Detaches the render and host callbacks, which point into this module, from an instance that
+  // outlives it in the cache or in a posted disposal.
+  bool detach_callbacks() const {
+    AURenderCallbackStruct none{};
+    HostCallbackInfo callbacks{};
+    return AudioUnitSetProperty(unit_, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input,
+                                0, &none, sizeof(none)) == noErr &&
+           AudioUnitSetProperty(unit_, kAudioUnitProperty_HostCallbacks, kAudioUnitScope_Global, 0,
+                                &callbacks, sizeof(callbacks)) == noErr;
   }
 
   // Returns the instance to the cache when it can be detached cleanly, otherwise disposes it.
   // The cache is called after the lifecycle lock is released because evicting takes it too.
   void detach(bool reusable) {
     if constexpr (main_lifecycle) {
-      const auto unit = std::exchange(unit_, nullptr);
-      const auto defaults = std::exchange(defaults_, nullptr);
-      auto *const callbacks = std::exchange(callbacks_, nullptr);
-      auto teardown = [unit, defaults, callbacks] {
-        PluginLifecycleLock lock;
-        if (!unit ||
-            (lock && (AudioUnitUninitialize(unit), AudioComponentInstanceDispose(unit) == noErr))) {
-          delete callbacks;
-          if (defaults) {
-            CFRelease(defaults);
-          }
-        }
-        // On lock/disposal failure the unit and its callback payload must both remain alive.
-      };
-      if (unit) {
-        if (MainThread::on_main()) {
-          teardown();
-        } else if (!MainThread::post(teardown)) {
-          std::fputs("Audio Unit: could not queue main-thread disposal\n", stderr);
-        }
-      } else {
-        delete callbacks;
-        if (defaults) {
-          CFRelease(defaults);
-        }
-      }
+      dispose_on_main(std::exchange(unit_, nullptr), std::exchange(defaults_, nullptr),
+                      std::exchange(callbacks_, nullptr));
       held_notes_ = {};
       acquired_cache_key_.clear();
       return;
@@ -887,22 +1047,17 @@ template <class Configuration> class AudioUnitModule {
         if constexpr (accepts_midi) {
           reusable = reusable && panic_midi() == VS_OK;
         }
-        AudioUnitUninitialize(unit_);
         if (reusable) {
-          AURenderCallbackStruct none{};
-          HostCallbackInfo callbacks{};
-          reusable =
-              AudioUnitSetProperty(unit_, kAudioUnitProperty_SetRenderCallback,
-                                   kAudioUnitScope_Input, 0, &none, sizeof(none)) == noErr &&
-              AudioUnitSetProperty(unit_, kAudioUnitProperty_HostCallbacks, kAudioUnitScope_Global,
-                                   0, &callbacks, sizeof(callbacks)) == noErr;
+          AudioUnitUninitialize(unit_);
+          reusable = detach_callbacks();
         }
         if (reusable) {
           cached = unit_;
           payload = defaults_;
           defaults_ = nullptr;
         } else {
-          AudioComponentInstanceDispose(unit_);
+          detach_callbacks();
+          dispose_on_main(unit_, nullptr, nullptr);
         }
         unit_ = nullptr;
       }
@@ -1000,8 +1155,7 @@ template <class Configuration> class AudioUnitModule {
     auto next = values_;
     next[i] = value;
     auto write = [&](size_t j) {
-      return AudioUnitSetParameter(unit_, Configuration::mapping[j].id, kAudioUnitScope_Global, 0,
-                                   effective(j, next[j], next), 0) == noErr;
+      return write_target(Configuration::mapping[j].id, effective(j, next[j], next));
     };
     if (unit_ && targetless(i)) {
       for (size_t j = 0; j < count; ++j) {
@@ -1153,20 +1307,74 @@ template <class Configuration> class AudioUnitModule {
       callbacks().beat = 0;
     }
     if constexpr (preparation_seconds > 0) {
-      uint32_t frames = static_cast<uint32_t>(std::ceil(preparation_seconds * info.sample_rate));
-      std::vector<float> silence;
-      std::array<std::vector<float>, 2> output;
-      // Preparation precedes frame zero without resetting the AU's newly settled state.
-      sample_time_ = -static_cast<double>(frames);
-      if (!render_silence(frames, info.max_frames, info.channels, silence, output,
-                          [this](const vs_process_block &audio, uint32_t count) {
-                            return render(audio, 0, count) == VS_OK;
-                          })) {
-        return VS_ERROR_PROCESS;
+      const auto frames = static_cast<uint32_t>(std::ceil(preparation_seconds * info.sample_rate));
+      // A fresh instance's startup work on the main thread must overlap rendering, so off the
+      // main thread its preparation advances at playback speed. On the main thread that work
+      // cannot run during preparation.
+      const bool paced = realtime_preparation && fresh_ && !MainThread::on_main();
+      std::vector<Difference> differences;
+      for (int attempt = 1;; ++attempt) {
+        if (!prepare_silence(frames, info, paced)) {
+          return VS_ERROR_PROCESS;
+        }
+        if constexpr (realtime_preparation) {
+          switch (verify_intended(differences)) {
+          case Verification::kept:
+            break;
+          case Verification::unreadable:
+            std::fprintf(stderr, "Audio Unit preparation: could not read parameter %u\n",
+                         unsigned(differences.front().target));
+            return VS_ERROR_PROCESS;
+          case Verification::reverted:
+            if (attempt == preparation_attempts) {
+              const auto &first = differences.front();
+              std::fprintf(stderr,
+                           "Audio Unit preparation: the plugin kept reverting parameter %u "
+                           "(given %g, holds %g; %zu differ)\n",
+                           unsigned(first.target), double(first.intended), double(first.actual),
+                           differences.size());
+              return VS_ERROR_UNSUPPORTED;
+            }
+            for (const auto &difference : differences) {
+              if (AudioUnitSetParameter(unit_, difference.target, kAudioUnitScope_Global, 0,
+                                        difference.intended, 0) != noErr) {
+                return VS_ERROR_PROCESS;
+              }
+            }
+            continue;
+          }
+        }
+        break;
       }
       callbacks().beat = 0;
     }
     return VS_OK;
+  }
+
+  // Renders `frames` of silence ending at frame zero, without resetting the AU's newly settled
+  // state, and when paced no faster than playback speed.
+  bool prepare_silence(uint32_t frames, const vs_prepare_info &info, bool paced) {
+    std::vector<float> silence;
+    std::array<std::vector<float>, 2> output;
+    sample_time_ = -static_cast<double>(frames);
+    const auto begun = std::chrono::steady_clock::now();
+    const auto paced_frames = static_cast<uint64_t>(std::ceil(paced_seconds * info.sample_rate));
+    uint64_t rendered = 0;
+    return render_silence(
+        frames, info.max_frames, info.channels, silence, output,
+        [&](const vs_process_block &audio, uint32_t count) {
+          if (render(audio, 0, count) != VS_OK) {
+            return false;
+          }
+          rendered += count;
+          if (paced) {
+            std::this_thread::sleep_until(
+                begun +
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(
+                    static_cast<double>(std::min(rendered, paced_frames)) / info.sample_rate)));
+          }
+          return true;
+        });
   }
 
   template <class Setup>
@@ -1197,15 +1405,11 @@ template <class Configuration> class AudioUnitModule {
         for (uint32_t c = 0; c < channels_; ++c) {
           callbacks().buffers[c].resize(max_frames_);
         }
+        fresh_ = !reused;
+        intended_.clear();
         if (!setup() || finish_prepare(info, timing, reused) != VS_OK) {
           detach(false);
           return VS_ERROR_UNSUPPORTED;
-        }
-        if constexpr (!main_lifecycle) {
-          if (readiness(info, timing) != VS_OK) {
-            detach(false);
-            return VS_ERROR_UNSUPPORTED;
-          }
         }
         return VS_OK;
       } catch (...) {
@@ -1224,11 +1428,16 @@ template <class Configuration> class AudioUnitModule {
           std::fputs("Audio Unit preparation: the main thread did not become available\n", stderr);
           return VS_ERROR_PROCESS;
         }
-        if (result == VS_OK && (result = readiness(info, timing)) != VS_OK) {
-          detach(false);
-        }
       } else {
         result = lifecycle();
+      }
+      // Outside the lifecycle lock: preparation can wait on the main thread, whose posted
+      // disposals take the lock.
+      if (result == VS_OK && (result = readiness(info, timing)) != VS_OK) {
+        detach(false);
+        if constexpr (!main_lifecycle) {
+          result = VS_ERROR_UNSUPPORTED;
+        }
       }
       if (result == VS_OK) {
         state_ = State::prepared;
@@ -1438,8 +1647,7 @@ template <class Configuration> class AudioUnitModule {
         valid = valid && self.validate(s.parameter);
       }
       for (const auto &s : Configuration::settings) {
-        valid = valid && AudioUnitSetParameter(self.unit_, s.parameter.id, kAudioUnitScope_Global,
-                                               0, s.value, 0) == noErr;
+        valid = valid && self.write_target(s.parameter.id, s.value);
       }
       for (size_t i = 0; valid && i < count; ++i) {
         valid = self.apply(i, self.values_[i]) == VS_OK;
@@ -1644,9 +1852,8 @@ template <class Configuration> class AudioUnitModule {
               target.name && self.validate(target.id, target.name, target.minimum, target.maximum);
         }
         for (uint32_t i = 0; valid && i < state_count; ++i) {
-          valid = std::isfinite(state[i].value) &&
-                  AudioUnitSetParameter(self.unit_, state[i].target, kAudioUnitScope_Global, 0,
-                                        state[i].value, 0) == noErr;
+          valid =
+              std::isfinite(state[i].value) && self.write_target(state[i].target, state[i].value);
         }
         return valid;
       });

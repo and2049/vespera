@@ -126,7 +126,15 @@ struct NativeModulePanel: NSViewRepresentable {
 
   final class Container: NSView {
     var lease: ModulePanelLease?
-    private var timer: Timer?
+    /// Panels poll their module so MIDI- and automation-driven changes show, but only while the
+    /// window can be seen.
+    enum Polling {
+      case paused
+      case active(Timer)
+      case stopped
+    }
+    private(set) var polling = Polling.paused
+    private var occlusionObserver: NSObjectProtocol?
     private let contentSize: CGSize
     private let insets: ModuleManifest.VisualInsets
 
@@ -158,9 +166,6 @@ struct NativeModulePanel: NSViewRepresentable {
         native.frame = bounds
         native.autoresizingMask = [.width, .height]
         addSubview(native)
-        timer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
-          MainActor.assumeIsolated { self?.lease?.refresh() }
-        }
       } else {
         let label = NSTextField(
           labelWithString: failure ?? "\(module.name) — no compatible module UI")
@@ -170,9 +175,47 @@ struct NativeModulePanel: NSViewRepresentable {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      if let occlusionObserver { NotificationCenter.default.removeObserver(occlusionObserver) }
+      occlusionObserver = nil
+      if let window {
+        occlusionObserver = NotificationCenter.default.addObserver(
+          forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in
+          MainActor.assumeIsolated { self?.updatePolling() }
+        }
+      }
+      updatePolling()
+    }
+
+    /// Polls while the panel is in a visible window; on resuming it refreshes at once so changes
+    /// made while hidden show without waiting for the first tick.
+    func updatePolling() {
+      let visible = window.map { $0.occlusionState.contains(.visible) } ?? false
+      switch polling {
+      case .stopped: return
+      case .active(let timer) where !visible:
+        timer.invalidate()
+        polling = .paused
+      case .paused where visible && lease != nil:
+        lease?.refresh()
+        let timer = Timer(timeInterval: 1 / 30, repeats: true) { [weak self] _ in
+          MainActor.assumeIsolated { self?.lease?.refresh() }
+        }
+        timer.tolerance = 1 / 120
+        RunLoop.main.add(timer, forMode: .default)
+        polling = .active(timer)
+      default: break
+      }
+    }
+
     func stop() {
-      timer?.invalidate()
-      timer = nil
+      if case .active(let timer) = polling { timer.invalidate() }
+      polling = .stopped
+      if let occlusionObserver { NotificationCenter.default.removeObserver(occlusionObserver) }
+      occlusionObserver = nil
       lease?.view.removeFromSuperview()
       lease = nil
     }

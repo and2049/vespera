@@ -155,6 +155,30 @@ struct StereoBuffers {
   }
 };
 
+// Mirrors fake_ae::invoke for a stream opened with one physical output.
+ae_process_result invoke_mono_output(const float *const *inputs, uint32_t input_channels,
+                                     float *output, uint32_t frames, uint64_t position) {
+  auto &state = fake_ae::control();
+  float *outputs[] = {output};
+  std::fill_n(output, frames, 0.0f);
+  ae_audio_block block{};
+  block.struct_size = sizeof(block);
+  block.inputs = inputs;
+  block.input_channels = input_channels;
+  block.outputs = outputs;
+  block.output_channels = 1;
+  block.frames = frames;
+  block.stream_id = state.stream_id;
+  block.configuration_generation = state.configuration_generation;
+  block.run_generation = state.run_generation;
+  block.frame_position = position;
+  const ae_process_result result = state.process(state.user, &block);
+  if (result != AE_PROCESS_OK) {
+    std::fill_n(output, frames, 0.0f);
+  }
+  return result;
+}
+
 double rms_of(const std::vector<float> &samples, uint32_t begin, uint32_t end) {
   double sum = 0.0;
   for (uint32_t i = begin; i < end; ++i) {
@@ -656,7 +680,7 @@ void test_parameter_not_applied_when_processing_fails() {
   const NodeId node = start_gain_session(session);
   const ParameterToken token = session.parameter_token();
   Buffers buffers(64);
-  buffers.input[3] = std::numeric_limits<float>::quiet_NaN();
+  buffers.input[3] = std::numeric_limits<float>::max();
   CHECK(session.set_parameter(token, node, 1, 2.0f) == ParameterResult::accepted);
   CHECK(buffers.run(64, 0) == AE_PROCESS_FAILED);
   const auto telemetry = session.poll().telemetry;
@@ -981,6 +1005,75 @@ void test_stereo_processing_keeps_channels_distinct() {
   CHECK(session.close() == CloseResult::closed);
 }
 
+enum class DoublerSwitch { off, at_prepare, while_running };
+
+// Renders 640 frames through a gain-2 graph into a one-channel output device, with the doubler
+// switched on as requested from the third 128-frame block when switched while running.
+std::vector<float> render_mono_device(uint32_t graph_channels, bool stereo_input,
+                                      DoublerSwitch doubler) {
+  AudioSession session;
+  const NodeId node = session.graph().add_module(gain_module);
+  session.set_parameter_value(node, 1, 2.0f);
+  vespera::StreamConfig stream = stereo_input ? stereo_config() : config(OutputMode::monitor);
+  stream.output_channels = {1, 0};
+  stream.output_channel_count = 1;
+  stream.graph_channels = graph_channels;
+  stream.core_io.doubler_delay_ms = 2.0f;
+  vespera::CoreIoSettings doubled = stream.core_io;
+  doubled.doubler_enabled = true;
+  if (doubler == DoublerSwitch::at_prepare) {
+    stream.core_io = doubled;
+  }
+  session.prepare(stream);
+  CHECK(session.core_io_settings() == stream.core_io);
+  session.start();
+  constexpr uint32_t block = 128;
+  std::vector<float> left(block);
+  std::vector<float> right(block);
+  std::vector<float> output(block);
+  std::vector<float> rendered;
+  for (uint32_t index = 0; index < 5; ++index) {
+    if (doubler == DoublerSwitch::while_running && index == 2) {
+      session.set_core_io_settings(doubled);
+      CHECK(session.core_io_settings() == doubled);
+    }
+    for (uint32_t i = 0; i < block; ++i) {
+      const uint32_t frame = index * block + i;
+      left[i] = 0.25f * std::sin(0.37f * static_cast<float>(frame));
+      right[i] = 0.125f * std::cos(0.11f * static_cast<float>(frame));
+    }
+    const float *inputs[] = {left.data(), right.data()};
+    counting_allocations.store(true);
+    allocation_count.store(0);
+    const auto result = invoke_mono_output(inputs, stereo_input ? 2 : 1, output.data(), block,
+                                           static_cast<uint64_t>(index) * block);
+    counting_allocations.store(false);
+    CHECK(result == AE_PROCESS_OK);
+    CHECK(allocation_count.load() == 0);
+    rendered.insert(rendered.end(), output.begin(), output.end());
+  }
+  CHECK(session.poll().state == SessionState::running);
+  CHECK(session.close() == CloseResult::closed);
+  return rendered;
+}
+
+void test_doubler_has_no_effect_on_mono_output_device() {
+  for (const auto &[graph_channels, stereo_input] :
+       {std::pair{1u, false}, std::pair{2u, false}, std::pair{2u, true}}) {
+    const auto dry = render_mono_device(graph_channels, stereo_input, DoublerSwitch::off);
+    CHECK(render_mono_device(graph_channels, stereo_input, DoublerSwitch::at_prepare) == dry);
+    CHECK(render_mono_device(graph_channels, stereo_input, DoublerSwitch::while_running) == dry);
+    bool exact = true;
+    for (uint32_t frame = 0; frame < dry.size(); ++frame) {
+      const float left = 0.25f * std::sin(0.37f * static_cast<float>(frame)) * 2.0f;
+      const float right =
+          stereo_input ? 0.125f * std::cos(0.11f * static_cast<float>(frame)) * 2.0f : left;
+      exact = exact && dry[frame] == left * 0.5f + right * 0.5f;
+    }
+    CHECK(exact);
+  }
+}
+
 void test_meters_mono_intervals_and_varying_blocks() {
   AudioSession session;
   const auto empty = session.read_meters();
@@ -1054,11 +1147,28 @@ void test_meters_stereo_separation_clip_and_silence() {
   CHECK(reading.outputs[1].clipped_samples == 3);
 
   buffers.right_input[6] = std::numeric_limits<float>::quiet_NaN();
-  CHECK(buffers.run(32, 64) == AE_PROCESS_FAILED);
+  counting_allocations.store(true);
+  allocation_count.store(0);
+  CHECK(buffers.run(32, 64) == AE_PROCESS_SILENCE);
+  counting_allocations.store(false);
+  CHECK(allocation_count.load() == 0);
+  reading = session.read_meters();
+  CHECK(reading.input_frames == 32 && reading.output_frames == 32);
+  CHECK(reading.inputs[1].clipped_samples == 3);
+  CHECK(reading.inputs[1].peak == vespera::meter_ceiling);
+  CHECK(reading.outputs[1].clipped_samples == 2);
+  CHECK(reading.outputs[1].peak == 1.5f);
+  CHECK(near(reading.outputs[1].rms, std::sqrt((1.0 + 2.25) / 32.0)));
+  CHECK(session.poll().telemetry.processing_failures == 0);
+
+  vespera::CoreIoSettings loud;
+  loud.input_gain_db = vespera::core_io_max_gain_db;
+  session.set_core_io_settings(loud);
+  buffers.right_input[6] = std::numeric_limits<float>::max();
+  CHECK(buffers.run(32, 96) == AE_PROCESS_FAILED);
   reading = session.read_meters();
   CHECK(reading.input_frames == 32 && reading.output_frames == 0);
   CHECK(reading.inputs[1].clipped_samples == 3);
-  CHECK(reading.inputs[1].peak == vespera::meter_ceiling);
   CHECK(meter_silent(reading.outputs[0]) && meter_silent(reading.outputs[1]));
   CHECK(session.close() == CloseResult::closed);
 
@@ -1098,6 +1208,8 @@ int main(int argc, char **argv) {
       {"stereo_prepare_requests_two_inputs", test_stereo_prepare_requests_two_inputs},
       {"stereo_configuration_rejected", test_stereo_configuration_rejected},
       {"stereo_processing_keeps_channels_distinct", test_stereo_processing_keeps_channels_distinct},
+      {"doubler_has_no_effect_on_mono_output_device",
+       test_doubler_has_no_effect_on_mono_output_device},
       {"meters_mono_intervals_and_varying_blocks", test_meters_mono_intervals_and_varying_blocks},
       {"meters_stereo_separation_clip_and_silence", test_meters_stereo_separation_clip_and_silence},
       {"parameter_immediate_and_offsets", test_parameter_immediate_and_offsets},

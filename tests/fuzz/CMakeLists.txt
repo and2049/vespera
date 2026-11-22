@@ -12,6 +12,7 @@ add_executable(vespera_live_graph_fuzz live_graph_fuzz.cpp ../scripted_audio_bac
 target_include_directories(vespera_live_graph_fuzz PRIVATE
   ${audio_io_core_SOURCE_DIR}/include ${audio_io_core_SOURCE_DIR}/src)
 target_link_libraries(vespera_live_graph_fuzz PRIVATE vespera_runtime vespera_core_io ${CMAKE_DL_LIBS})
+target_link_libraries(vespera_live_graph_fuzz PRIVATE vespera_take)
 target_link_options(vespera_live_graph_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
 target_compile_definitions(vespera_live_graph_fuzz PRIVATE VESPERA_GAIN_PATH="$<TARGET_FILE:vespera_fixture_gain>")
 add_dependencies(vespera_live_graph_fuzz vespera_fixture_gain)

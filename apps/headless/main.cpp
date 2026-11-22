@@ -5,6 +5,9 @@
 #include <vespera/preset.hpp>
 #include <vespera/runtime.hpp>
 
+#include "offline_render.hpp"
+#include "wav_file.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -101,6 +104,8 @@ struct RenderCommand {
   std::vector<ParameterChange> changes;
   std::optional<std::filesystem::path> preset;
   std::optional<std::filesystem::path> save_preset;
+  std::optional<std::filesystem::path> input;
+  std::optional<std::filesystem::path> output;
 };
 
 struct HelpCommand {};
@@ -135,9 +140,15 @@ commands:
       --at FRAME:NODE:PARAM=VALUE
                                 Schedule at an absolute sample position in this run.
       (core IO options below also apply)
-  render                        Render a unit impulse offline through the graph.
+  render                        Render a unit impulse, or a recorded take, offline through the graph.
+      --input FILE              Render a mono or stereo WAV take at its own sample rate instead,
+                                through core IO and the graph as stream does, sample-aligned
+                                with the take and followed by the graph and core IO tail (at
+                                most 10 s). Requires --output; excludes --rate, --length, --at.
+      --output FILE             Write the --input render as a stereo 32-bit float WAV file.
       --rate HZ                 Sample rate (default 48000).
-      --frames N                Maximum block size (default 128).
+      --frames N                Maximum block size (default 128); with --input the fixed block
+                                size, at most 4096.
       --graph-channels N        Process a mono (1) or stereo (2) graph (default 2).
       --length N                Frames to render (default 48000).
       --module PATH             Append a module binary to the graph; may repeat.
@@ -455,16 +466,22 @@ Command parse(int argc, char **argv) {
   }
   if (command == "render") {
     RenderCommand render;
+    std::optional<uint32_t> rate;
+    std::optional<uint32_t> length;
     while (!args.done()) {
       const std::string arg = args.next();
       if (arg == "--rate") {
-        render.sample_rate = parse_uint(args.value(arg), 8000, max_sample_rate, "--rate");
+        rate = parse_uint(args.value(arg), 8000, max_sample_rate, "--rate");
       } else if (arg == "--frames") {
         render.frames = parse_uint(args.value(arg), 1, max_block_frames, "--frames");
       } else if (arg == "--graph-channels") {
         render.graph_channels = parse_uint(args.value(arg), 1, 2, "--graph-channels");
       } else if (arg == "--length") {
-        render.length = parse_uint(args.value(arg), 1, max_render_frames, "--length");
+        length = parse_uint(args.value(arg), 1, max_render_frames, "--length");
+      } else if (arg == "--input") {
+        render.input = args.value(arg);
+      } else if (arg == "--output") {
+        render.output = args.value(arg);
       } else if (parse_core_io_option(arg, args, render.core_io)) {
         continue;
       } else if (arg == "--module") {
@@ -481,6 +498,25 @@ Command parse(int argc, char **argv) {
         throw UsageError("unknown render option " + arg);
       }
     }
+    if (render.input || render.output) {
+      if (!render.input || !render.output) {
+        throw UsageError("render --input and --output must be given together");
+      }
+      if (rate || length) {
+        throw UsageError("render --input uses the take's sample rate and length; omit --rate and "
+                         "--length");
+      }
+      if (std::any_of(render.changes.begin(), render.changes.end(),
+                      [](const auto &change) { return change.frame.has_value(); })) {
+        throw UsageError("render --input takes --set but not --at");
+      }
+      if (render.frames > vespera::offline_render_max_block_size) {
+        throw UsageError("render --input needs --frames of at most " +
+                         std::to_string(vespera::offline_render_max_block_size));
+      }
+    }
+    render.sample_rate = rate.value_or(render.sample_rate);
+    render.length = length.value_or(render.length);
     return render;
   }
   if (command == "inspect") {
@@ -871,6 +907,82 @@ uint64_t fnv1a(uint64_t hash, float sample) {
   return hash;
 }
 
+void print_core_io(const vespera::CoreIoSettings &io, uint64_t input_latency) {
+  std::printf("core_io: input_gain_db=%.9g output_gain_db=%.9g gate=%s gate_threshold_db=%.9g"
+              " transpose_st=%.9g doubler=%s doubler_ms=%.9g input_latency=%" PRIu64 "\n",
+              static_cast<double>(io.input_gain_db), static_cast<double>(io.output_gain_db),
+              io.gate_enabled ? "on" : "off", static_cast<double>(io.gate_threshold_db),
+              static_cast<double>(io.transpose_semitones), io.doubler_enabled ? "on" : "off",
+              static_cast<double>(io.doubler_delay_ms), input_latency);
+}
+
+// Renders a recorded take through core IO and the graph, writing the latency-aligned result and
+// its tail. Parameters set with --set apply before the graph is prepared.
+int run_render_take(const RenderCommand &command, vespera::Graph &graph) {
+  for (const auto &change : command.changes) {
+    graph.set_parameter_value(change.node, change.parameter, change.value);
+  }
+  vespera::WavReader reader(*command.input);
+  const auto format = reader.format();
+  if (format.channels > command.graph_channels) {
+    throw UsageError("a stereo --input needs --graph-channels 2");
+  }
+  uint64_t checksum = 0xcbf29ce484222325ull;
+  float peak = 0.0f;
+  uint64_t peak_frame = 0;
+  uint64_t written = 0;
+  bool module_errors = false;
+  vespera::OfflineRenderer renderer(graph, {static_cast<double>(format.sample_rate), command.frames,
+                                            format.channels, command.graph_channels, 120.0,
+                                            command.core_io});
+  std::optional<vespera::WavWriter> writer;
+  writer.emplace(*command.output, format.sample_rate, 2);
+  try {
+    vespera::OfflineStream stream;
+    stream.read = [&](float *const *channels, uint64_t frames) {
+      return reader.read(channels, frames);
+    };
+    stream.write = [&](const float *const *channels, uint64_t frames) {
+      for (uint64_t i = 0; i < frames; ++i) {
+        for (uint32_t channel = 0; channel < 2; ++channel) {
+          const float sample = channels[channel][i];
+          checksum = fnv1a(checksum, sample);
+          if (std::fabs(sample) > peak) {
+            peak = std::fabs(sample);
+            peak_frame = written + i;
+          }
+        }
+      }
+      writer->write(channels, frames);
+      written += frames;
+    };
+    vespera::render_aligned(renderer, stream);
+    writer->close();
+    const uint64_t latency = renderer.latency_frames();
+    std::printf("render: rate=%" PRIu32 " frames=%" PRIu32 " input_channels=%" PRIu32
+                " input_frames=%" PRIu64 " output_frames=%" PRIu64 " modules=%u nodes=%" PRIu32
+                " latency=%" PRIu64 " tail=%" PRIu64 "\n",
+                format.sample_rate, command.frames, format.channels, format.frames, written,
+                static_cast<unsigned>(command.modules.size()), graph.node_count(), latency,
+                renderer.tail_frames());
+    if (command.core_io != vespera::CoreIoSettings{}) {
+      print_core_io(command.core_io, latency - graph.latency_frames());
+    }
+    std::printf("checksum=%016" PRIx64 " peak=%.9g peak_frame=%" PRIu64 " non_finite=0\n", checksum,
+                static_cast<double>(peak), peak_frame);
+    module_errors = report_module_status(graph);
+    if (command.save_preset && !module_errors) {
+      vespera::write_preset(*command.save_preset, graph.capture_preset());
+    }
+  } catch (...) {
+    writer.reset();
+    std::error_code ignored;
+    std::filesystem::remove(*command.output, ignored);
+    throw;
+  }
+  return module_errors ? exit_failure : exit_ok;
+}
+
 // Offline renders run module work inline, so their output does not depend on timing.
 int run_render(const RenderCommand &command) {
   const auto services = vespera::HostServices::create({vespera::HostWorkMode::synchronous});
@@ -889,6 +1001,9 @@ int run_render(const RenderCommand &command) {
   auto &graph = *owned_graph;
   apply_files(graph, command.files);
   validate_changes(graph.nodes(), command.changes);
+  if (command.input) {
+    return run_render_take(command, graph);
+  }
   auto changes = command.changes;
   for (const auto &change : changes) {
     if (change.frame.value_or(0) >= command.length) {
@@ -986,13 +1101,7 @@ int run_render(const RenderCommand &command) {
               static_cast<unsigned>(command.modules.size()), graph.node_count(),
               graph.latency_frames());
   if (command.core_io != vespera::CoreIoSettings{}) {
-    const auto &io = command.core_io;
-    std::printf("core_io: input_gain_db=%.9g output_gain_db=%.9g gate=%s gate_threshold_db=%.9g"
-                " transpose_st=%.9g doubler=%s doubler_ms=%.9g input_latency=%" PRIu32 "\n",
-                static_cast<double>(io.input_gain_db), static_cast<double>(io.output_gain_db),
-                io.gate_enabled ? "on" : "off", static_cast<double>(io.gate_threshold_db),
-                static_cast<double>(io.transpose_semitones), io.doubler_enabled ? "on" : "off",
-                static_cast<double>(io.doubler_delay_ms), core_io.input_latency_frames());
+    print_core_io(command.core_io, core_io.input_latency_frames());
   }
   std::printf("checksum=%016" PRIx64 " peak=%.9g peak_frame=%" PRIu64 " non_finite=%" PRIu64 "\n",
               checksum, static_cast<double>(peak), peak_frame, non_finite);

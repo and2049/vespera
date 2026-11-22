@@ -4,7 +4,7 @@ if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0 CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(Vespera VERSION 0.1.0 LANGUAGES C CXX)
+project(Vespera VERSION 0.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,12 +95,23 @@ add_library(vespera_presets STATIC src/preset.cpp)
 target_link_libraries(vespera_presets PUBLIC vespera_runtime PRIVATE nlohmann_json::nlohmann_json)
 vespera_warnings(vespera_presets)
 
+add_library(vespera_wav STATIC src/wav_file.cpp)
+target_include_directories(vespera_wav PUBLIC ${PROJECT_SOURCE_DIR}/src)
+vespera_warnings(vespera_wav)
+
 add_library(vespera_core_io STATIC src/core_io.cpp)
 target_include_directories(vespera_core_io PUBLIC include)
 vespera_warnings(vespera_core_io)
 
-add_library(vespera_audio STATIC src/audio_session.cpp)
-target_link_libraries(vespera_audio PUBLIC vespera_runtime vespera_core_io audio_engine::audio_engine)
+add_library(vespera_take STATIC src/take_recorder.cpp)
+target_link_libraries(vespera_take PUBLIC vespera_wav Threads::Threads
+  PRIVATE nlohmann_json::nlohmann_json)
+vespera_warnings(vespera_take)
+
+add_library(vespera_audio STATIC src/audio_session.cpp src/offline_render.cpp
+  src/reamp_job.cpp)
+target_link_libraries(vespera_audio PUBLIC vespera_runtime vespera_core_io vespera_wav
+  audio_engine::audio_engine vespera_take)
 vespera_warnings(vespera_audio)
 
 add_library(vespera_app_audio SHARED src/app_audio.cpp)

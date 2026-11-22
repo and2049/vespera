@@ -139,3 +139,63 @@ check_cli(unknown_module_inspect 0 "module=org.test.missing" inspect
   --preset "${WORK}/unresolved.json" --module "${GAIN}")
 file(WRITE "${WORK}/malformed.json" "{not a preset}")
 check_cli(malformed_preset 1 "error:" render --preset "${WORK}/malformed.json")
+
+# Recorded takes: mono16.wav is 1000 frames at 48 kHz of 16-bit PCM with 0.5 at frame 0, -0.25 at
+# frame 10 and 0.125 at frame 500; stereo-float.wav is 300 frames at 44.1 kHz with 0.5 on the
+# left at frame 0 and -1 on the right at frame 5; nan-float.wav holds a NaN at frame 3.
+set(take_output "${WORK}/take.wav")
+check_cli(take_gain 0
+  "input_channels=1 input_frames=1000 output_frames=1000 modules=1 nodes=1 latency=0 tail=0.*peak=0.25 peak_frame=0 non_finite=0"
+  render --module "${GAIN}" --set 0:1=0.5 --input "${TAKES}/mono16.wav" --output "${take_output}")
+if(NOT EXISTS "${take_output}")
+  message(FATAL_ERROR "render --input wrote no output file")
+endif()
+execute_process(COMMAND "${HOST}" render --module "${GAIN}" --set 0:1=0.5
+  --input "${TAKES}/mono16.wav" --output "${take_output}"
+  COMMAND_ERROR_IS_FATAL ANY OUTPUT_VARIABLE take_first)
+execute_process(COMMAND "${HOST}" render --input "${take_output}" --output "${WORK}/again.wav"
+  COMMAND_ERROR_IS_FATAL ANY OUTPUT_VARIABLE take_again)
+string(REGEX MATCH "checksum=[0-9a-f]+" take_first_checksum "${take_first}")
+string(REGEX MATCH "checksum=[0-9a-f]+" take_again_checksum "${take_again}")
+if(take_first_checksum STREQUAL "" OR NOT take_first_checksum STREQUAL take_again_checksum)
+  message(FATAL_ERROR "A written take does not read back as rendered\n${take_first}${take_again}")
+endif()
+check_cli(take_stereo 0
+  "rate=44100 .*input_channels=2 input_frames=300 output_frames=300 .*peak=1 peak_frame=5"
+  render --input "${TAKES}/stereo-float.wav" --output "${take_output}")
+check_cli(take_doubler_tail 0 "output_frames=1480 .*tail=480.*doubler=on doubler_ms=10"
+  render --input "${TAKES}/mono16.wav" --output "${take_output}" --doubler-ms 10)
+check_cli(take_transpose_latency 0 "latency=722 tail=722.*input_latency=722"
+  render --input "${TAKES}/mono16.wav" --output "${take_output}" --transpose-st 3)
+execute_process(COMMAND "${HOST}" render --input "${TAKES}/mono16.wav" --output "${take_output}"
+  --frames 7 --doubler --transpose-st -5 --gate-threshold-db -20
+  COMMAND_ERROR_IS_FATAL ANY OUTPUT_VARIABLE take_small)
+execute_process(COMMAND "${HOST}" render --input "${TAKES}/mono16.wav" --output "${take_output}"
+  --frames 4096 --doubler --transpose-st -5 --gate-threshold-db -20
+  COMMAND_ERROR_IS_FATAL ANY OUTPUT_VARIABLE take_large)
+string(REGEX MATCH "checksum=[0-9a-f]+" take_small_checksum "${take_small}")
+string(REGEX MATCH "checksum=[0-9a-f]+" take_large_checksum "${take_large}")
+if(take_small_checksum STREQUAL "" OR NOT take_small_checksum STREQUAL take_large_checksum)
+  message(FATAL_ERROR "Take render depends on block size\n${take_small}${take_large}")
+endif()
+check_cli(take_stereo_mono_graph 2 "stereo --input needs --graph-channels 2" render
+  --input "${TAKES}/stereo-float.wav" --output "${take_output}" --graph-channels 1)
+check_cli(take_without_output 2 "--input and --output must be given together" render
+  --input "${TAKES}/mono16.wav")
+check_cli(output_without_take 2 "--input and --output must be given together" render
+  --output "${take_output}")
+check_cli(take_with_rate 2 "omit --rate and --length" render --input "${TAKES}/mono16.wav"
+  --output "${take_output}" --rate 44100)
+check_cli(take_with_length 2 "omit --rate and --length" render --input "${TAKES}/mono16.wav"
+  --output "${take_output}" --length 64)
+check_cli(take_with_at 2 "takes --set but not --at" render --module "${GAIN}"
+  --input "${TAKES}/mono16.wav" --output "${take_output}" --at 5:0:1=0.5)
+check_cli(take_large_block 2 "--frames of at most 4096" render --input "${TAKES}/mono16.wav"
+  --output "${take_output}" --frames 4097)
+check_cli(take_missing 1 "missing.wav: cannot be opened" render --input "${WORK}/missing.wav"
+  --output "${take_output}")
+check_cli(take_non_finite 0 "input_frames=10 output_frames=10 .*peak=0.25 peak_frame=0 non_finite=0"
+  render --input "${TAKES}/nan-float.wav" --output "${WORK}/nan.wav")
+if(NOT EXISTS "${WORK}/nan.wav")
+  message(FATAL_ERROR "A take with a non-finite sample did not render")
+endif()

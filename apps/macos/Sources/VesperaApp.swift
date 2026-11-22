@@ -39,16 +39,22 @@ enum ModuleTab: String, CaseIterable, Identifiable {
     }
   }
 
-  var image: NSImage {
-    guard
-      let url = Bundle.module.url(
-        forResource: rawValue, withExtension: "svg", subdirectory: "Icons"),
-      let image = NSImage(contentsOf: url)
-    else {
+  @MainActor var image: NSImage {
+    guard let image = Self.images[self] else {
       preconditionFailure("Missing tab icon: \(rawValue)")
     }
     return image
   }
+
+  @MainActor private static let images = Dictionary(
+    uniqueKeysWithValues: allCases.compactMap { tab -> (ModuleTab, NSImage)? in
+      guard
+        let url = Bundle.module.url(
+          forResource: tab.rawValue, withExtension: "svg", subdirectory: "Icons"),
+        let image = NSImage(contentsOf: url)
+      else { return nil }
+      return (tab, image)
+    })
 }
 
 /// Statuses of the shown tab's modules that are not ready, one line each, as inline status text:
@@ -168,7 +174,7 @@ struct VesperaWindow: View {
         )
         .frame(width: geometry.size.width, height: geometry.size.height)
     }
-    .background(WindowBackgroundView(image: amps.activeAmp?.windowBackground))
+    .background(WindowBackgroundView(image: amps.windowBackground))
     .preferredColorScheme(.dark)
     .onChange(of: tabs) { _, tabs in
       if !tabs.contains(selectedTab) { selectedTab = .amp }
@@ -200,8 +206,8 @@ struct VesperaWindow: View {
 
       GlobalControls(
         settings: Binding(get: { audio.globals }, set: { audio.updateGlobals($0) }),
-        stereoAvailable: audio.stereoAvailable, inputLevels: audio.inputLevels,
-        outputLevels: audio.outputLevels, audioRunning: audio.state == .running,
+        stereoAvailable: audio.stereoAvailable, meters: audio.meters,
+        audioRunning: audio.state == .running,
         presets: presets)
 
       if selectedTab == .amp {
@@ -229,7 +235,7 @@ struct VesperaWindow: View {
       TempoControls(audio: audio).padding(.trailing, 24).padding(.bottom, 24)
     }
     .overlay(alignment: .bottomLeading) {
-      VStack(alignment: .leading, spacing: 4) {
+      TakeControls(audio: audio, takes: audio.takes) {
         if let notice = audio.notice {
           HStack {
             Text(notice).statusMessage()
@@ -239,15 +245,8 @@ struct VesperaWindow: View {
           .frame(maxWidth: 360, alignment: .leading)
         }
         ModuleStatusLine(notices: audio.moduleNotices(on: selectedTab))
-        if let message = audio.preparationMessage {
-          HStack {
-            Text(message).statusMessage()
-            if audio.canCancelPreparation {
-              Button("Cancel", action: audio.cancelPreparation).buttonStyle(.plain)
-            }
-          }
-          .foregroundStyle(Theme.secondary)
-          .frame(maxWidth: 360, alignment: .leading)
+        if let error = audio.preparationError {
+          Text(error).statusMessage().frame(maxWidth: 360, alignment: .leading)
         }
       }
       .padding(.leading, 24).padding(.bottom, 24)
@@ -313,7 +312,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     self.window = window
     NSApp.activate(ignoringOtherApps: true)
     ComponentGalleryWindow.openIfRequested()
-    audio.start()
+    // Starting audio prepares the rig on the main thread, so the window's first frame is
+    // committed before it rather than appearing only once the rig is ready.
+    content.displayIfNeeded()
+    CATransaction.flush()
+    DispatchQueue.main.async { [weak self] in self?.audio.start() }
   }
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

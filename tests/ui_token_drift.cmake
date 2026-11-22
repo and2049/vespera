@@ -11,6 +11,8 @@ set(files
   apps/macos/Sources/AudioSettingsView.swift
   apps/macos/Sources/MIDIControls.swift
   apps/macos/Sources/TempoControls.swift
+  apps/macos/Sources/TakeControls.swift
+  apps/macos/Sources/ControlPill.swift
   apps/macos/Sources/ComponentGallery.swift
   apps/macos/Sources/GlobalControls.swift
   apps/macos/Sources/PresetControls.swift

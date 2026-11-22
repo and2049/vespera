@@ -227,13 +227,13 @@ struct InputModeControl: View {
   }
 }
 
-struct GlobalControls: View {
-  @Binding var settings: GlobalControlSettings
-  let stereoAvailable: Bool
-  var inputLevels: [Float] = [0, 0]
-  var outputLevels: [Float] = [0, 0]
-  var audioRunning = false
-  let presets: PresetController
+/// One peak meter, observing the levels itself so that only the meter redraws as they change.
+struct LevelMeter: View {
+  enum Side { case input, output }
+  @ObservedObject var meters: MeterLevels
+  let side: Side
+  let stereo: Bool
+  let audioRunning: Bool
 
   private enum Meter {
     static let floorDecibels = -60.0
@@ -241,11 +241,9 @@ struct GlobalControls: View {
     static let height: CGFloat = 116
   }
 
-  private var separator: some View {
-    Rectangle().fill(Theme.separator).frame(width: 1, height: 106)
-  }
-
-  private func meter(_ title: String, stereo: Bool, levels: [Float]) -> some View {
+  var body: some View {
+    let title = side == .input ? "Input" : "Output"
+    let levels = side == .input ? meters.input : meters.output
     HStack(spacing: 1) {
       ForEach(0..<(stereo ? 2 : 1), id: \.self) { channel in
         let peak = channel < levels.count ? levels[channel] : 0
@@ -266,10 +264,24 @@ struct GlobalControls: View {
     }
     .help("\(title) \(stereo ? "L/R" : "mono") meter — \(audioRunning ? "live" : "audio stopped")")
   }
+}
+
+struct GlobalControls: View {
+  @Binding var settings: GlobalControlSettings
+  let stereoAvailable: Bool
+  var meters = MeterLevels()
+  var audioRunning = false
+  let presets: PresetController
+
+  private var separator: some View {
+    Rectangle().fill(Theme.separator).frame(width: 1, height: 106)
+  }
 
   var body: some View {
     HStack(alignment: .top, spacing: 20) {
-      meter("Input", stereo: stereoAvailable && settings.stereoInput, levels: inputLevels)
+      LevelMeter(
+        meters: meters, side: .input, stereo: stereoAvailable && settings.stereoInput,
+        audioRunning: audioRunning)
       VStack(spacing: 15) {
         Text("INPUT")
         ControlKnob(
@@ -311,7 +323,7 @@ struct GlobalControls: View {
           defaultValue: 0, centerValue: 0)
       }
       .frame(width: 64)
-      meter("Output", stereo: true, levels: outputLevels)
+      LevelMeter(meters: meters, side: .output, stereo: true, audioRunning: audioRunning)
     }
     .font(Theme.font(Theme.captionSize, weight: .semibold))
     .foregroundStyle(Theme.primary)

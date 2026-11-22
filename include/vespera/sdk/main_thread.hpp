@@ -39,7 +39,8 @@ namespace vespera::sdk {
  * queue order except for inline calls on the main thread. Separate images have independent
  * sources, so neither a different image's job nor an inline call drains earlier posts.
  * Posted jobs must own all their data by value: they routinely outlive the object that posted
- * them.
+ * them. post_after(seconds, job) is post through a one-shot main run-loop timer instead, for
+ * retrying later without occupying the main thread meanwhile; it is unordered with posts.
  *
  * alive(timeout) is call with an empty job. wait(seconds) sleeps off the main thread and runs the
  * main run loop in its default mode on it, so main-thread jobs keep running.
@@ -116,6 +117,39 @@ public:
       delete stored;
       return false;
     }
+    return true;
+  }
+
+  template <class Job> static bool post_after(double seconds, Job &&job) noexcept {
+    using Stored = std::decay_t<Job>;
+    if (!pin()) {
+      return false;
+    }
+    Stored *stored = nullptr;
+    try {
+      stored = new Stored(std::forward<Job>(job));
+    } catch (...) {
+      return false;
+    }
+    CFRunLoopTimerContext context{};
+    context.info = stored;
+    auto *timer = CFRunLoopTimerCreate(
+        nullptr, CFAbsoluteTimeGetCurrent() + std::max(seconds, 0.0), 0, 0, 0,
+        [](CFRunLoopTimerRef, void *info) {
+          auto *posted = static_cast<Stored *>(info);
+          try {
+            (*posted)();
+          } catch (...) {
+          }
+          delete posted;
+        },
+        &context);
+    if (!timer) {
+      delete stored;
+      return false;
+    }
+    CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+    CFRelease(timer);
     return true;
   }
 

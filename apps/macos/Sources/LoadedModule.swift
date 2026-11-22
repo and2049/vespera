@@ -32,8 +32,9 @@ final class LoadedModule: Identifiable {
   let cabinetSupport: ModuleManifest.CabinetSupport?
   let cabinetPreview: NSImage?
   let cabinetPreviewHeight: Double
-  /// The amp's decoded main-window background; nil keeps the plain window colour.
-  let windowBackground: CGImage?
+  /// The amp's main-window background, with only its PNG header checked; `AmpCatalog` decodes
+  /// and fully validates it when the amp is selected. Nil keeps the plain window colour.
+  let windowBackground: URL?
   /// The routes a Special FX module can take; one unless `routeSelector` chooses among them.
   let routes: [SpecialFXRoute]
   /// The parameter whose value chooses the route.
@@ -299,9 +300,7 @@ final class LoadedModule: Identifiable {
       try manifest.resource($0, relativeTo: directory)
     }
     let layout = try manifest.layout(relativeTo: directory)
-    let windowBackground = try manifest.windowBackground(relativeTo: directory).map {
-      try WindowBackgroundImage.decode($0)
-    }
+    let windowBackground = try manifest.windowBackground(relativeTo: directory)
     let routing = try manifest.specialFXRoutes()
     let routeDescription = try manifest.routeDescription()
     if manifest.eq != nil && category != "amp" {

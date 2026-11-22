@@ -99,6 +99,26 @@ public:
     return result;
   }
 
+  // Whether `source_id` names a present source, found directly by its unique ID rather than by
+  // enumerating sources. The endpoints of a device that has gone away stay findable by ID while
+  // marked offline, so an offline source counts as unavailable.
+  static bool source_available(int32_t source_id) {
+#ifdef __APPLE__
+    MIDIObjectRef object = 0;
+    MIDIObjectType type;
+    if (source_id == 0 || MIDIObjectFindByUniqueID(source_id, &object, &type) != noErr ||
+        type != kMIDIObjectType_Source) {
+      return false;
+    }
+    SInt32 offline = 0;
+    return MIDIObjectGetIntegerProperty(object, kMIDIPropertyOffline, &offline) != noErr ||
+           offline == 0;
+#else
+    (void)source_id;
+    return false;
+#endif
+  }
+
   void refresh_generation() {
 #ifdef __APPLE__
     std::lock_guard lock(mutex_);

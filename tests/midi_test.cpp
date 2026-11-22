@@ -1,4 +1,5 @@
 #include "fake_audio_engine.h"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -245,6 +246,45 @@ int main(int argc, char **argv) {
     SInt32 source_id = 0;
     check(MIDIObjectGetIntegerProperty(virtual_source.source, kMIDIPropertyUniqueID, &source_id) ==
           noErr);
+
+    // The direct lookup agrees with the enumeration, including for sources that come and go.
+    check(MidiInput::source_available(source_id));
+    check(!MidiInput::source_available(0));
+    for (const auto &listed : MidiInput::sources()) {
+      check(MidiInput::source_available(listed.id));
+    }
+    auto source_listed = [](SInt32 id) {
+      const auto listed = MidiInput::sources();
+      return std::any_of(listed.begin(), listed.end(),
+                         [id](const MidiSource &entry) { return entry.id == id; });
+    };
+    MIDIEndpointRef transient = 0;
+    check(MIDISourceCreate(virtual_source.client, CFSTR("vespera transient source"), &transient) ==
+          noErr);
+    SInt32 transient_id = 0;
+    check(MIDIObjectGetIntegerProperty(transient, kMIDIPropertyUniqueID, &transient_id) == noErr);
+    check(MidiInput::source_available(transient_id) && source_listed(transient_id));
+    check(MIDIObjectSetIntegerProperty(transient, kMIDIPropertyOffline, 1) == noErr);
+    check(!MidiInput::source_available(transient_id));
+    check(MIDIObjectSetIntegerProperty(transient, kMIDIPropertyOffline, 0) == noErr);
+    check(MidiInput::source_available(transient_id));
+    check(MIDIEndpointDispose(transient) == noErr);
+    check(!MidiInput::source_available(transient_id) && !source_listed(transient_id));
+    check(MIDISourceCreate(virtual_source.client, CFSTR("vespera returning source"), &transient) ==
+          noErr);
+    check(MIDIObjectSetIntegerProperty(transient, kMIDIPropertyUniqueID, transient_id) == noErr);
+    check(MidiInput::source_available(transient_id) && source_listed(transient_id));
+    check(MIDIEndpointDispose(transient) == noErr);
+    MIDIEndpointRef destination = 0;
+    check(MIDIDestinationCreate(
+              virtual_source.client, CFSTR("vespera test destination"),
+              [](const MIDIPacketList *, void *, void *) {}, nullptr, &destination) == noErr);
+    SInt32 destination_id = 0;
+    check(MIDIObjectGetIntegerProperty(destination, kMIDIPropertyUniqueID, &destination_id) ==
+          noErr);
+    check(!MidiInput::source_available(destination_id));
+    check(MIDIEndpointDispose(destination) == noErr);
+
     MidiQueue device_queue;
     MidiInput device_input;
     device_input.connect(device_queue, 7, source_id, 2);

@@ -1,6 +1,7 @@
 #include <vespera/audio_session.hpp>
 
 #include "samples.hpp"
+#include "take_recorder.hpp"
 
 #include <audio_engine/engine.h>
 
@@ -21,6 +22,15 @@ constexpr uint32_t max_output_channels = 2;
 bool valid_graph_channels(uint32_t channels) noexcept { return channels == 1 || channels == 2; }
 
 uint32_t input_channel_count(InputMode mode) noexcept { return mode == InputMode::stereo ? 2 : 1; }
+
+// The callback always conditions two output channels and averages them for a mono device, where a
+// doubled copy would only comb-filter the dry signal, so the doubler is withheld from mono devices.
+CoreIoSettings device_core_io(CoreIoSettings settings, uint32_t output_channels) noexcept {
+  if (output_channels == 1) {
+    settings.doubler_enabled = false;
+  }
+  return settings;
+}
 
 std::string describe(int32_t code, const std::string &operation, const std::string &detail) {
   std::string text = operation + ": " + audio_result_name(code);
@@ -410,6 +420,8 @@ struct AudioSession::CallbackState {
   // Control-owned totals at the start of the current read_meters interval.
   MeterTotals meter_baseline{};
 
+  TakeRecorder take;
+
   void meter(uint32_t channel, const float *samples, uint32_t block_frames) noexcept {
     const BlockLevel level = measure(samples, block_frames);
     raise_peak(meter_peaks[channel], level.peak);
@@ -652,9 +664,7 @@ ae_process_result process_stream(void *user, const ae_audio_block *block) noexce
   }
   state.beat_position.store(state.tempo.beat_position(), std::memory_order_relaxed);
 
-  const bool input_finite = meter_inputs(state, *block);
   const uint32_t frames = block->frames;
-
   std::array<const float *, max_output_channels> conditioned{};
   std::array<float *, max_output_channels> conditioned_dest{};
   const size_t stride = active.max_frames();
@@ -662,22 +672,26 @@ ae_process_result process_stream(void *user, const ae_audio_block *block) noexce
     conditioned_dest[channel] = state.conditioned_input.data() + channel * stride;
     conditioned[channel] = conditioned_dest[channel];
   }
-  if (input_finite && !state.core_io.process_input(block->inputs, conditioned_dest.data(),
-                                                   block->input_channels, frames)) {
-    state.processing_failures.fetch_add(1, std::memory_order_relaxed);
-    state.publish_meters();
-    silence(*block);
-    return AE_PROCESS_FAILED;
+
+  // The meters show the raw input, counting non-finite samples as clipped; everything after them,
+  // the take included, sees those samples as zero, so they never stop the stream.
+  const float *const *device_input = block->inputs;
+  if (!meter_inputs(state, *block)) {
+    vespera::detail::copy_zeroing_non_finite(block->inputs, conditioned_dest.data(),
+                                             block->input_channels, frames);
+    device_input = conditioned.data();
   }
-  if (input_finite &&
+  state.take.capture(device_input, frames, tempo.beat_position, tempo.bpm,
+                     (flags & VS_PROCESS_DISCONTINUITY) != 0);
+  if (!state.core_io.process_input(device_input, conditioned_dest.data(), block->input_channels,
+                                   frames) ||
       !vespera::detail::finite_samples(conditioned.data(), block->input_channels, frames)) {
     state.processing_failures.fetch_add(1, std::memory_order_relaxed);
     state.publish_meters();
     silence(*block);
     return AE_PROCESS_FAILED;
   }
-  const std::span<const float *const> graph_input(input_finite ? conditioned.data() : block->inputs,
-                                                  block->input_channels);
+  const std::span<const float *const> graph_input(conditioned.data(), block->input_channels);
 
   ReplacementStage stage = state.stage.load(std::memory_order_acquire);
   if (stage == ReplacementStage::queued) {
@@ -703,7 +717,7 @@ ae_process_result process_stream(void *user, const ae_audio_block *block) noexce
         active.process(graph_input, frames, block->frame_position, flags, {}, &tempo);
     const vs_result incoming_result =
         incoming.process(graph_input, frames, block->frame_position, incoming_flags, {}, &tempo);
-    if (outgoing_result != VS_OK || incoming_result != VS_OK || !input_finite) {
+    if (outgoing_result != VS_OK || incoming_result != VS_OK) {
       state.processing_failures.fetch_add(1, std::memory_order_relaxed);
       state.publish_meters();
       silence(*block);
@@ -735,8 +749,7 @@ ae_process_result process_stream(void *user, const ae_audio_block *block) noexce
         [](const Event &a, const Event &b) { return a.frame_offset() < b.frame_offset(); });
     const std::span<const Event> events(state.events.begin(), end);
     if (active.process(graph_input, frames, block->frame_position, flags, events, &tempo) !=
-            VS_OK ||
-        !input_finite) {
+        VS_OK) {
       state.processing_failures.fetch_add(1, std::memory_order_relaxed);
       state.publish_meters();
       silence(*block);
@@ -966,7 +979,7 @@ void AudioSession::set_core_io_settings(const CoreIoSettings &settings) {
   }
   CallbackState &callback = *callback_;
   if (state_ == SessionState::prepared) {
-    if (!callback.core_io.set_settings(settings)) {
+    if (!callback.core_io.set_settings(device_core_io(settings, callback.output_channels))) {
       throw std::invalid_argument("core IO settings were rejected");
     }
     callback.settings_stage.store(CallbackState::SettingsStage::idle, std::memory_order_release);
@@ -975,7 +988,7 @@ void AudioSession::set_core_io_settings(const CoreIoSettings &settings) {
         CallbackState::SettingsStage::idle) {
       throw std::logic_error("a core IO settings update is already queued");
     }
-    callback.pending_settings = settings;
+    callback.pending_settings = device_core_io(settings, callback.output_channels);
     callback.settings_stage.store(CallbackState::SettingsStage::queued, std::memory_order_release);
   }
   core_io_settings_ = settings;
@@ -1331,7 +1344,7 @@ void AudioSession::prepare_graph(const StreamConfig &config, std::unique_ptr<Gra
     state.core_io.prepare(static_cast<double>(format.sample_rate), format.max_frames_per_block,
                           config.core_io.transpose_semitones == 0.0f ? TransposeLatency::none
                                                                      : TransposeLatency::fixed,
-                          config.core_io);
+                          device_core_io(config.core_io, config.output_channel_count));
     state.tempo.prepare(format.sample_rate, config.tempo, config.initial_beat);
     state.midi_sample_rate = format.sample_rate;
     state.beat_position.store(config.initial_beat, std::memory_order_relaxed);
@@ -1409,6 +1422,7 @@ void AudioSession::stop() {
     fail(result, "ae_stream_stop");
   }
   callback_installed_ = false;
+  callback_->take.settle_quiescent();
   if (callback_->settings_stage.load(std::memory_order_acquire) ==
       CallbackState::SettingsStage::queued) {
     static_cast<void>(callback_->core_io.set_settings(callback_->pending_settings));
@@ -1443,6 +1457,7 @@ void AudioSession::stop() {
 
 CloseResult AudioSession::close() noexcept {
   if (stream_ == nullptr) {
+    callback_->take.finish();
     release_prepared_resources();
     state_ = SessionState::stopped;
     recovery_ = RecoveryReason::none;
@@ -1456,6 +1471,7 @@ CloseResult AudioSession::close() noexcept {
     }
     callback_installed_ = false;
   }
+  callback_->take.finish();
   release_prepared_resources();
   const ae_result closed = ae_stream_close(stream_);
   if (closed != AE_OK) {
@@ -1556,6 +1572,21 @@ MeterReading AudioSession::read_meters() noexcept {
   return reading;
 }
 
+void AudioSession::start_take(const TakeOptions &options) {
+  require_state(SessionState::running, "start_take");
+  callback_->take.start(options, TakeFormat{info_.sample_rate, info_.input_channels,
+                                            info_.frames_per_block, info_.max_frames_per_block});
+}
+
+void AudioSession::stop_take() noexcept {
+  callback_->take.stop();
+  if (!callback_installed_) {
+    callback_->take.settle_quiescent();
+  }
+}
+
+TakeStatus AudioSession::take_status() const { return callback_->take.status(); }
+
 const StreamInfo &AudioSession::stream_info() const {
   if (state_ != SessionState::prepared && state_ != SessionState::running) {
     throw std::logic_error("stream_info requires a prepared or running session");
@@ -1571,6 +1602,10 @@ void AudioSession::require_state(SessionState expected, const char *operation) c
 }
 
 void AudioSession::enter_recovery(RecoveryReason reason, int32_t code) noexcept {
+  callback_->take.stop();
+  if (!callback_installed_) {
+    callback_->take.settle_quiescent();
+  }
   state_ = SessionState::recovery_required;
   if (recovery_ != RecoveryReason::quiescence_failure || !callback_installed_) {
     recovery_ = reason;

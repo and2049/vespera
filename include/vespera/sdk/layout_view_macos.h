@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <sys/stat.h>
@@ -818,6 +819,20 @@ vs_layout_described(NSDictionary *spec, NSInteger version,
 }
 
 enum class vs_layout_behaviour { continuous, toggle, cycle, radio, tap };
+
+// The inputs a control's drawing depends on that can change without the control being told.
+struct vs_layout_appearance {
+  float value;
+  float follows;
+  NSString *text;
+  BOOL focused;
+
+  bool matches(const vs_layout_appearance &other) const {
+    return std::memcmp(&value, &other.value, sizeof value) == 0 &&
+           std::memcmp(&follows, &other.follows, sizeof follows) == 0 && focused == other.focused &&
+           (text == other.text || [text isEqualToString:other.text]);
+  }
+};
 }
 
 @interface VSArtworkControl : NSControl <NSTextFieldDelegate> {
@@ -834,6 +849,8 @@ enum class vs_layout_behaviour { continuous, toggle, cycle, radio, tap };
   vs_layout_behaviour behaviour;
   // How the module shows this widget's parameter, used when the layout specifies no text.
   std::optional<vespera::ParameterDisplay> described;
+  // What the control last drew from, so a refresh that finds nothing changed draws nothing.
+  std::optional<vs_layout_appearance> applied;
 @public
   // Layout-unit rectangle the control occupies: rect, extended by a travelling slider handle.
   NSRect frameRect;
@@ -1243,12 +1260,26 @@ enum class vs_layout_behaviour { continuous, toggle, cycle, radio, tap };
   if (condition.count == 3) {
     float value = 0;
     host.get_value(host.context, [condition[0] unsignedIntValue], &value);
-    self.hidden = value < [condition[1] floatValue] || value > [condition[2] floatValue];
+    BOOL hidden = value < [condition[1] floatValue] || value > [condition[2] floatValue];
+    if (self.hidden != hidden) {
+      self.hidden = hidden;
+    }
   }
-  if (field && !field.currentEditor) {
-    field.stringValue = [self displayValue];
+  NSString *text =
+      field || [spec[@"type"] isEqualToString:@"textEditor"] ? [self displayValue] : nil;
+  if (field && !field.currentEditor && ![field.stringValue isEqualToString:text]) {
+    field.stringValue = text;
   }
-  self.needsDisplay = YES;
+  NSArray *follows = spec[@"imageFollows"];
+  vs_layout_appearance appearance{
+      [self value],
+      follows ? [self read:[follows[0] unsignedIntValue] fallback:[follows[1] floatValue]] : 0,
+      field ? nil : text,
+      vs_ui_has_focus(self)};
+  if (!applied || !applied->matches(appearance)) {
+    applied = appearance;
+    self.needsDisplay = YES;
+  }
 }
 - (NSString *)displayValue {
   return [self text:[self value]];
@@ -1598,9 +1629,18 @@ enum class vs_layout_behaviour { continuous, toggle, cycle, radio, tap };
 @implementation VSArtworkFile
 - (void)refresh {
   NSString *name = self.fileName ? self.fileName(self.slot) : nil;
-  self.title = name.length ? name : self.placeholder.length ? self.placeholder : @"Choose File…";
-  self.toolTip = self.title;
-  self.enabled = self.fileAction != nil;
+  NSString *title = name.length               ? name
+                    : self.placeholder.length ? self.placeholder
+                                              : @"Choose File…";
+  if (![self.title isEqualToString:title]) {
+    self.title = title;
+  }
+  if (![self.toolTip isEqualToString:title]) {
+    self.toolTip = title;
+  }
+  if (self.enabled != (self.fileAction != nil)) {
+    self.enabled = self.fileAction != nil;
+  }
 }
 - (void)mouseDown:(NSEvent *)event {
   if (self.fileAction) {
@@ -1806,6 +1846,5 @@ enum class vs_layout_behaviour { continuous, toggle, cycle, radio, tap };
   for (VSArtworkControl *control in self.subviews) {
     [control refresh];
   }
-  self.needsDisplay = YES;
 }
 @end

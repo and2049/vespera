@@ -474,6 +474,35 @@ void special_fx(const vs_app_audio_api *api, const SpecialFixtures &fixtures) {
   check(near(output(), 0.1f));
   send_bytes(note_on);
   check(stays_at(0.1f));
+
+  // A source that disappears is forgotten at the next status poll and stays forgotten when a
+  // source with the same unique ID returns, until it is chosen again.
+  auto status_source = [&] {
+    return send({{"op", "status"}}).at("value").at("midiSource").get<int32_t>();
+  };
+  MIDIEndpointRef transient = 0;
+  check(MIDISourceCreate(virtual_source.client, CFSTR("vespera transient source"), &transient) ==
+        noErr);
+  SInt32 transient_id = 0;
+  check(MIDIObjectGetIntegerProperty(transient, kMIDIPropertyUniqueID, &transient_id) == noErr);
+  check(send({{"op", "midi"}, {"source", transient_id}, {"channel", 2}, {"slot", "specialFX"}})
+            .at("ok"));
+  check(status_source() == transient_id);
+  check(status_source() == transient_id);
+  check(MIDIEndpointDispose(transient) == noErr);
+  check(status_source() == 0);
+  check(!send({{"op", "midi"}, {"source", transient_id}, {"channel", 2}, {"slot", "specialFX"}})
+             .at("ok")
+             .get<bool>());
+  check(MIDISourceCreate(virtual_source.client, CFSTR("vespera returning source"), &transient) ==
+        noErr);
+  check(MIDIObjectSetIntegerProperty(transient, kMIDIPropertyUniqueID, transient_id) == noErr);
+  check(status_source() == 0);
+  check(send({{"op", "midi"}, {"source", transient_id}, {"channel", 2}, {"slot", "specialFX"}})
+            .at("ok"));
+  check(status_source() == transient_id);
+  check(MIDIEndpointDispose(transient) == noErr);
+  check(status_source() == 0);
 #endif
 
   check(send({{"op", "stop"}}).at("ok"));
