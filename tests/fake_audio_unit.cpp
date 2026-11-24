@@ -271,7 +271,10 @@ OSStatus render(void *instance, AudioUnitRenderActionFlags *flags, const AudioTi
   return noErr;
 }
 
-OSStatus reset(void *, AudioUnitScope, AudioUnitElement) { return noErr; }
+OSStatus reset(void *, AudioUnitScope, AudioUnitElement) {
+  ++fake_au::counters().resets;
+  return noErr;
+}
 
 AudioComponentMethod lookup(SInt16 selector) {
   switch (selector) {

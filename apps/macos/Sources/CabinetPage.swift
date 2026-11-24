@@ -52,13 +52,7 @@ struct CabinetPreview: View {
 struct CabinetPage: View {
   @ObservedObject var catalog: CabinetCatalog
 
-  private var iconBundle: Bundle {
-    #if SWIFT_PACKAGE
-      Bundle.module
-    #else
-      Bundle.main
-    #endif
-  }
+  @State private var expanded: String?
 
   var body: some View {
     ZStack(alignment: .bottom) {
@@ -93,7 +87,8 @@ struct CabinetPage: View {
         .allowsHitTesting(false)
       HStack(spacing: 12) {
         Button(action: catalog.toggleEnabled) {
-          controlIcon("power")
+          CarouselControlIcon(name: "power")
+            .frame(width: 56, height: 56).contentShape(Rectangle())
             .opacity(catalog.enabled ? 1 : 0.4)
         }
         .buttonStyle(.plain)
@@ -101,13 +96,15 @@ struct CabinetPage: View {
         .help(catalog.enabled ? "Bypass cabinet" : "Enable cabinet")
         .accessibilityLabel("Cabinet power")
         .accessibilityValue(catalog.enabled ? "On" : "Off")
-        ModuleCarousel(
+        BrowsableCarousel(
           modules: catalog.cabinets, selectedIndex: catalog.selectedIndex,
-          label: "Cabinet selection", enabled: !catalog.locked, capturesScroll: false,
-          width: 400, onSelect: catalog.select
+          label: "Cabinet selection", browseTitle: "Browse cabinets",
+          disabledHint: catalog.locked ? "Unlink cabinet to choose another" : nil,
+          expanded: $expanded, onSelect: catalog.select
         )
         Button(action: catalog.toggleLock) {
-          controlIcon(catalog.locked ? "link" : "unlink")
+          CarouselControlIcon(name: catalog.locked ? "link" : "unlink")
+            .frame(width: 56, height: 56).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(catalog.locked ? "Unlink cabinet from amplifier" : "Link cabinet to amplifier")
@@ -116,13 +113,15 @@ struct CabinetPage: View {
       }
       .padding(.bottom, 12)
     }
-    .background(
-      CarouselScrollInput(
-        onStep: CarouselNavigation(
-          count: catalog.cabinets.count, selectedIndex: catalog.selectedIndex,
-          onSelect: catalog.select
-        ).step)
-    )
+    .background {
+      if expanded == nil, !catalog.locked {
+        CarouselScrollInput(
+          onStep: CarouselNavigation(
+            count: catalog.cabinets.count, selectedIndex: catalog.selectedIndex,
+            onSelect: catalog.select
+          ).step)
+      }
+    }
     .overlay(alignment: .top) {
       if let error = catalog.error {
         Text(error).statusMessage()
@@ -130,13 +129,4 @@ struct CabinetPage: View {
     }
   }
 
-  @ViewBuilder
-  private func controlIcon(_ name: String) -> some View {
-    if let url = iconBundle.url(forResource: name, withExtension: "svg", subdirectory: "Icons"),
-      let image = NSImage(contentsOf: url)
-    {
-      Image(nsImage: image).resizable().frame(width: 40, height: 40)
-        .frame(width: 56, height: 56).contentShape(Rectangle())
-    }
-  }
 }

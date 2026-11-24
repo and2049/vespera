@@ -135,6 +135,7 @@ private struct DropdownAnchor {
   let options: [SettingsOption]
   let selection: String
   let size: UISize
+  let browse: Bool
   let choose: (String) -> Void
   let dismiss: () -> Void
 }
@@ -254,6 +255,8 @@ struct SettingsDropdown: View {
   @Binding var expanded: String?
   var placeholder = "Select device"
   var surface = Surface.inset
+  var browse = false
+  var helpText: String?
   @Environment(\.uiSize) private var size
   @Environment(\.isEnabled) private var enabled
   @State private var hovered = false
@@ -265,31 +268,36 @@ struct SettingsDropdown: View {
     Button {
       expanded = open ? nil : title
     } label: {
-      HStack(spacing: 0) {
-        Text(selected?.title ?? placeholder)
-          .lineLimit(1).truncationMode(.tail)
-          .frame(maxWidth: .infinity, alignment: .leading)
-        Image(systemName: open ? "chevron.up" : "chevron.down")
-          .font(Theme.chevronFont(metrics))
-          .foregroundStyle(Theme.secondary)
-          .frame(width: size.dropdownAccessoryWidth - metrics.horizontal_padding)
+      if browse {
+        CarouselControlIcon(name: "browse")
+          .opacity(hovered || open ? 1 : 0.7)
+      } else {
+        HStack(spacing: 0) {
+          Text(selected?.title ?? placeholder)
+            .lineLimit(1).truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          Image(systemName: open ? "chevron.up" : "chevron.down")
+            .font(Theme.chevronFont(metrics))
+            .foregroundStyle(Theme.secondary)
+            .frame(width: size.dropdownAccessoryWidth - metrics.horizontal_padding)
+        }
+        .font(Theme.font(metrics.font_size))
+        .foregroundStyle(Theme.primary)
+        .padding(.leading, metrics.horizontal_padding)
+        .padding(.trailing, metrics.horizontal_padding)
+        .frame(height: metrics.control_height)
+        .background(
+          fill(active: enabled && (hovered || open)),
+          in: RoundedRectangle(cornerRadius: metrics.corner_radius)
+        )
+        .overlay {
+          RoundedRectangle(cornerRadius: metrics.corner_radius)
+            .strokeBorder(
+              Theme.borderHover.opacity(enabled && (hovered || open) ? 1 : 0),
+              lineWidth: Theme.borderWidth)
+        }
+        .contentShape(Rectangle())
       }
-      .font(Theme.font(metrics.font_size))
-      .foregroundStyle(Theme.primary)
-      .padding(.leading, metrics.horizontal_padding)
-      .padding(.trailing, metrics.horizontal_padding)
-      .frame(height: metrics.control_height)
-      .background(
-        fill(active: enabled && (hovered || open)),
-        in: RoundedRectangle(cornerRadius: metrics.corner_radius)
-      )
-      .overlay {
-        RoundedRectangle(cornerRadius: metrics.corner_radius)
-          .strokeBorder(
-            Theme.borderHover.opacity(enabled && (hovered || open) ? 1 : 0),
-            lineWidth: Theme.borderWidth)
-      }
-      .contentShape(Rectangle())
     }
     .buttonStyle(FocusRingButtonStyle(radius: metrics.corner_radius))
     .disabled(options.isEmpty)
@@ -300,12 +308,16 @@ struct SettingsDropdown: View {
       selected.map { option in option.group.map { "\(option.title), \($0)" } ?? option.title }
         ?? "No selection"
     )
-    .help(selected.flatMap { option in option.group.map { "\($0) — \(option.title)" } } ?? "")
+    .help(
+      helpText ?? selected.flatMap { option in option.group.map { "\($0) — \(option.title)" } }
+        ?? ""
+    )
     .anchorPreference(key: DropdownPreference.self, value: .bounds) { anchor in
       open
         ? [
           DropdownAnchor(
             key: title, bounds: anchor, options: options, selection: selection, size: size,
+            browse: browse,
             choose: {
               selection = $0
               expanded = nil
@@ -384,17 +396,19 @@ private struct SettingsDropdownMenu: View {
     let height = menuHeight(rows: rows.count)
     let below = bounds.maxY + Theme.menuOffset
     let opensBelow =
-      below + menuHeight(rows: content.maximumRowCount)
-      <= container.height - 2 * Theme.menuOffset
+      !dropdown.browse
+      && below + menuHeight(rows: content.maximumRowCount)
+        <= container.height - 2 * Theme.menuOffset
     let y =
       opensBelow ? below : max(2 * Theme.menuOffset, bounds.minY - height - Theme.menuOffset)
     let width =
-      content.grouped
+      content.grouped || dropdown.browse
       ? min(max(bounds.width, groupedMenuMinimumWidth), container.width - 2 * Theme.menuOffset)
       : bounds.width
+    let anchorX = dropdown.browse ? bounds.maxX - width : bounds.minX
     let x =
-      content.grouped
-      ? max(Theme.menuOffset, min(bounds.minX, container.width - Theme.menuOffset - width))
+      content.grouped || dropdown.browse
+      ? max(Theme.menuOffset, min(anchorX, container.width - Theme.menuOffset - width))
       : bounds.minX
     ScrollViewReader { proxy in
       ScrollView {

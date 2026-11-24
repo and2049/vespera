@@ -1,6 +1,59 @@
 import AppKit
 import SwiftUI
 
+struct CarouselControlIcon: View {
+  static let hitSize: CGFloat = 48
+  let name: String
+
+  var body: some View {
+    #if SWIFT_PACKAGE
+      let bundle = Bundle.module
+    #else
+      let bundle = Bundle.main
+    #endif
+    if let url = bundle.url(forResource: name, withExtension: "svg", subdirectory: "Icons"),
+      let image = NSImage(contentsOf: url)
+    {
+      Image(nsImage: image).resizable().frame(width: 40, height: 40)
+        .frame(width: Self.hitSize, height: Self.hitSize).contentShape(Rectangle())
+    }
+  }
+}
+
+struct BrowsableCarousel: View {
+  let modules: [LoadedModule]
+  let selectedIndex: Int
+  let label: String
+  let browseTitle: String
+  var disabledHint: String?
+  @Binding var expanded: String?
+  let onSelect: (Int) -> Void
+
+  var body: some View {
+    let spacing: CGFloat = 4
+    HStack(spacing: spacing) {
+      ModuleCarousel(
+        modules: modules, selectedIndex: selectedIndex, label: label, enabled: disabledHint == nil,
+        capturesScroll: false, width: 400, onSelect: onSelect)
+      SettingsDropdown(
+        title: browseTitle,
+        options: modules.map { SettingsOption(id: $0.id, title: $0.name, group: $0.pluginFamily) },
+        selection: Binding(
+          get: { modules.indices.contains(selectedIndex) ? modules[selectedIndex].id : "" },
+          set: { id in
+            guard disabledHint == nil, let index = modules.firstIndex(where: { $0.id == id }),
+              index != selectedIndex
+            else { return }
+            onSelect(index)
+          }),
+        expanded: $expanded, browse: true, helpText: disabledHint ?? browseTitle
+      )
+      .disabled(disabledHint != nil)
+    }
+    .padding(.leading, spacing + CarouselControlIcon.hitSize)
+  }
+}
+
 @MainActor
 struct CarouselNavigation {
   let count: Int

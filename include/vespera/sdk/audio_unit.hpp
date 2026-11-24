@@ -310,6 +310,8 @@ struct RoutePin {
  * the host tempo is not known until processing begins. All members of a shared run must use the
  * same policy; it participates in engine and cache identity. Preparation runs outside the
  * lifecycle lock.
+ * Optional preserve_preparation_on_start keeps fresh AU state through the first process block's
+ * discontinuity. Explicit resets, later discontinuities and reused instances still reset.
  * Optional preparation_in_real_time, for plugins whose startup work on the main thread must
  * overlap rendering, renders a fresh instance's preparation_seconds no faster than playback off
  * the main thread, then gives the instance again any parameter values that work reverted and
@@ -679,10 +681,20 @@ template <class Configuration> class AudioUnitModule {
     if constexpr (custom_prepare) {
       key += "|prepare-instance";
     }
+    if constexpr (preserve_preparation) {
+      key += "|preserve-first-block";
+    }
     return key;
   }
 
   enum class State { idle, prepared, failed };
+  static constexpr bool preserve_preparation = [] {
+    if constexpr (requires { Configuration::preserve_preparation_on_start; }) {
+      return bool(Configuration::preserve_preparation_on_start);
+    }
+    return false;
+  }();
+  bool first_fresh_block_ = false;
   State state_ = State::idle;
   std::array<float, count> values_{};
   uint32_t channels_ = 0;
@@ -1440,6 +1452,7 @@ template <class Configuration> class AudioUnitModule {
         }
       }
       if (result == VS_OK) {
+        first_fresh_block_ = fresh_;
         state_ = State::prepared;
       } else {
         sample_time_ = 0;
@@ -1509,9 +1522,11 @@ template <class Configuration> class AudioUnitModule {
       }
       previous_midi_offset = e.frame_offset;
     }
-    if (block->flags & VS_PROCESS_DISCONTINUITY) {
+    if ((block->flags & VS_PROCESS_DISCONTINUITY) &&
+        !(preserve_preparation && first_fresh_block_)) {
       reset(this);
     }
+    first_fresh_block_ = false;
     if (state_ != State::prepared) {
       return VS_ERROR_PROCESS;
     }
@@ -1666,6 +1681,7 @@ template <class Configuration> class AudioUnitModule {
 #ifdef __APPLE__
     auto &self = *static_cast<AudioUnitModule *>(instance);
     if (self.state_ == State::prepared) {
+      self.first_fresh_block_ = false;
       if (AudioUnitReset(self.unit_, kAudioUnitScope_Global, 0) != noErr) {
         self.state_ = State::failed;
       }

@@ -27,6 +27,7 @@ struct Counters {
   std::atomic<int> closed{0};
   std::atomic<int> closed_off_main{0};
   std::atomic<int> initialized{0};
+  std::atomic<int> resets{0};
   // Main-thread work that ran after its instance had been disposed.
   std::atomic<int> stale_work{0};
 };

@@ -5,6 +5,7 @@ struct AmpCarousel: View {
   var showsPanel = true
   var cabinet: LoadedModule? = nil
   var showsEqualizer = false
+  @State private var expanded: String?
 
   var body: some View {
     ZStack(alignment: .bottom) {
@@ -30,17 +31,21 @@ struct AmpCarousel: View {
             .statusMessage()
             .padding(.horizontal, 50)
         }
-        ModuleCarousel(
+        BrowsableCarousel(
           modules: catalog.amps, selectedIndex: catalog.selectedIndex,
-          label: "Amplifier selection", capturesScroll: false, width: 400,
+          label: "Amplifier selection", browseTitle: "Browse amplifiers", expanded: $expanded,
           onSelect: catalog.select)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(
-      CarouselScrollInput(
-        onStep: CarouselNavigation(
-          count: catalog.amps.count, selectedIndex: catalog.selectedIndex, onSelect: catalog.select
-        ).step))
+    .background {
+      if expanded == nil {
+        CarouselScrollInput(
+          onStep: CarouselNavigation(
+            count: catalog.amps.count, selectedIndex: catalog.selectedIndex,
+            onSelect: catalog.select
+          ).step)
+      }
+    }
   }
 }

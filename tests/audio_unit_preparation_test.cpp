@@ -174,13 +174,14 @@ vs_result prepare(void *instance, const vs_host_instance_cache *cache = nullptr)
                                                sizeof(vs_shared_target), nullptr, 0, &timing);
 }
 
-template <class Wrapper = Module> float first_output(void *instance) {
+template <class Wrapper = Module> float first_output(void *instance, uint32_t flags = 0) {
   std::array<float, 128> in{}, out{};
   in.fill(.5f);
   const float *inputs[] = {in.data()};
   float *outputs[] = {out.data()};
   vs_process_block block{sizeof(block), inputs, outputs, 1,       128, 0, 0,
                          nullptr,       0,      nullptr, nullptr, 0,   0};
+  block.flags = flags;
   check(Wrapper::api.process(instance, &block) == VS_OK);
   return out[0];
 }
@@ -198,6 +199,27 @@ void startup_work_completes_before_frame_zero() {
       Module::api.destroy(instance);
     });
   }
+  settle();
+}
+
+void only_the_first_fresh_block_preserves_preparation() {
+  struct Preserved : Configuration {
+    enum { preserve_preparation_on_start = true };
+  };
+  using Wrapper = vespera::sdk::AudioUnitModule<Preserved>;
+  check(std::string(Module::shared_api()->engine) != Wrapper::shared_api()->engine);
+  behave({});
+  void *instance = nullptr;
+  check(Wrapper::api.create(&instance) == VS_OK);
+  check(prepare<Wrapper>(instance) == VS_OK);
+  int before = fake_au::counters().resets;
+  first_output<Wrapper>(instance, VS_PROCESS_DISCONTINUITY);
+  check(fake_au::counters().resets == before);
+  first_output<Wrapper>(instance, VS_PROCESS_DISCONTINUITY);
+  check(fake_au::counters().resets == before + 1);
+  Wrapper::api.reset(instance);
+  check(fake_au::counters().resets == before + 2);
+  Wrapper::api.destroy(instance);
   settle();
 }
 
@@ -383,6 +405,8 @@ void only_fresh_instances_off_main_are_paced() {
 int main(int argc, char **argv) {
   fake_au::register_component();
   const std::pair<const char *, void (*)()> tests[] = {
+      {"only_the_first_fresh_block_preserves_preparation",
+       only_the_first_fresh_block_preserves_preparation},
       {"startup_work_completes_before_frame_zero", startup_work_completes_before_frame_zero},
       {"reverted_values_are_given_again", reverted_values_are_given_again},
       {"persistent_reverts_fail_preparation", persistent_reverts_fail_preparation},
